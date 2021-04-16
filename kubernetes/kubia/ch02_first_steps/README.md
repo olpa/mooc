@@ -14,3 +14,10 @@ ps aux | grep app.js
 docker stop kubia-container
 docker rm kubia-container
 ```
+
+```
+docker tag kubia olpa/kubia
+docker images | head
+docker push olpa/kubia
+docker run -p 8080:8080 -d olpa/kubia
+```
