@@ -12,5 +12,5 @@ class HasRectangleIntersectionJsonstrMatcher(BaseMatcher):
         description.append_text('rectangles should intersect')
 
 
-def has_intersection_jsonstr():
+def has_rectangle_intersection_jsonstr_matcher():
     return HasRectangleIntersectionJsonstrMatcher()
