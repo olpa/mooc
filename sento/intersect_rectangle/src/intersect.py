@@ -39,7 +39,13 @@ def has_interval_intersection(
 
 def has_rectangle_intersection(rect_pair) -> bool:
     validate_rect_pair(rect_pair)
-    return rect_pair["rectangle2"]["y1"] < 0
+    r1 = rect_pair["rectangle1"]
+    r2 = rect_pair["rectangle2"]
+    has_x = has_interval_intersection(
+            r1["x1"], r1["x2"], r2["x1"], r2["x2"])
+    has_y = has_interval_intersection(
+            r1["y1"], r1["y2"], r2["y1"], r2["y2"])
+    return has_x and has_y
 
 
 def has_rectangle_intersection_jsonstr(s_json: str) -> bool:
