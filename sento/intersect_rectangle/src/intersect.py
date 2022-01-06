@@ -1,3 +1,32 @@
+"""
+Having the coordinates of two rectangles,
+determine if they intersect or not.
+Public functions of the module:
+
+    - `has_rectangle_intersection(rect_pair)`
+    - `has_rectangle_intersection_jsonstr(s_json: str)`
+
+An rectangle is a mapping with fields: `x1`, `y1`, `x2`, `y2`.
+The point (`x1`, `y1`) is one corner, the point (`x2`, `y2`)
+is the diagonally opposite corner.
+
+There are no implications on the location of the base points,
+it can be any of left-bottom, left-top, right-top or right-bottom.
+
+A rectangle pair is a mapping with two fields, `rectangle1`
+and `rectangle2`. The function that gets a string json as input,
+parses the json to a python mapping.
+
+The functions validate the input and throw `ValueError` if
+the input doesn't match expectations.
+
+The border of a rectangle belongs to the rectangle. It means
+that if two rectangle touch each other, then we consider them
+to intersect as well. In particular, degenerative rectangles
+(of zero width and zero height) _do_ intersect if they are at
+the same location.
+"""
+
 import json
 import collections.abc
 import numbers
@@ -38,6 +67,7 @@ def has_interval_intersection(
 
 
 def has_rectangle_intersection(rect_pair) -> bool:
+    """ See the docstring of the module """
     validate_rect_pair(rect_pair)
     r1 = rect_pair["rectangle1"]
     r2 = rect_pair["rectangle2"]
@@ -49,5 +79,6 @@ def has_rectangle_intersection(rect_pair) -> bool:
 
 
 def has_rectangle_intersection_jsonstr(s_json: str) -> bool:
+    """ See the docstring of the module """
     rect_pair = json.loads(s_json)
     return has_rectangle_intersection(rect_pair)

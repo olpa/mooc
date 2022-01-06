@@ -11,3 +11,17 @@ You have a JSON that contains the coordinates of two rectangles. Using the JSON 
 - **Completeness:** did you complete the features? Are all the unit tests running?
 - **Correctness:** does the functionality act insensible, thought-out ways?
 - **Maintainability:** is it written in a clean, maintainable way?
+
+## Result
+
+The description as a module docstring: see the file `./src/intersect.py`.
+
+To run tests:
+
+- install the module `pyhamcrest`, https://pypi.org/project/PyHamcrest/
+- install the linter `flake8`
+- run the linter and tests:
+
+```
+make
+```
