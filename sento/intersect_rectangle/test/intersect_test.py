@@ -1,10 +1,11 @@
 import unittest
 from hamcrest import assert_that, is_not, described_as, calling, raises
 
-from lib import has_rectangle_intersection_jsonstr_matcher
+from lib import has_rectangle_intersection_jsonstr_matcher, \
+        has_interval_intersection_matcher, pairwise
 
 from intersect import has_rectangle_intersection_jsonstr, \
-    has_rectangle_intersection
+        has_rectangle_intersection
 
 
 class HasIntersectionJsonstrTest(unittest.TestCase):
@@ -81,15 +82,32 @@ class HasIntersectionTest(unittest.TestCase):
                 }, "Bad field 'y2'",
                 ]
 
-        def pairwise(t):
-            it = iter(t)
-            return zip(it, it)
-
         for (fixture, describe) in pairwise(fixture_set):
             assert_that(
                     calling(has_rectangle_intersection).with_args(fixture),
                     described_as(describe,
                                  raises(ValueError)))
+
+    def test_intersect_coordinate(self):
+        # interval1.1, interval1.2, interval2.1, interval2.2
+        fixture_set = [
+                (1, 2, 3, 4), False, (1, 2, 4, 3), False,
+                (1, 3, 2, 4), True,  (1, 3, 4, 2), True,
+                (1, 4, 2, 3), True,  (1, 4, 3, 2), True,
+                (2, 1, 3, 4), False, (2, 1, 4, 3), False,
+                (2, 3, 1, 4), True,  (2, 3, 4, 1), True,
+                (2, 4, 1, 3), True,  (2, 4, 3, 1), True,
+                (3, 1, 2, 4), True,  (3, 1, 4, 2), True,
+                (3, 2, 1, 4), True,  (3, 2, 4, 1), True,
+                (3, 4, 1, 2), False, (3, 4, 2, 1), False,
+                (4, 1, 2, 3), True,  (4, 1, 3, 2), True,
+                (4, 2, 1, 3), True,  (4, 2, 3, 1), True,
+                (4, 3, 1, 2), False, (4, 3, 2, 1), False]
+        for (fixture, expected) in pairwise(fixture_set):
+            matcher = has_interval_intersection_matcher()
+            if not expected:
+                matcher = is_not(matcher)
+            assert_that(fixture, matcher)
 
 
 if '__main__' == __name__:
