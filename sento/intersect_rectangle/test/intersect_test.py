@@ -2,6 +2,7 @@ import unittest
 from hamcrest import assert_that, is_not, described_as, calling, raises
 
 from lib import has_rectangle_intersection_jsonstr_matcher, \
+        has_rectangle_intersection_matcher, \
         has_interval_intersection_matcher, pairwise
 
 from intersect import has_rectangle_intersection_jsonstr, \
@@ -108,6 +109,19 @@ class HasIntersectionTest(unittest.TestCase):
             if not expected:
                 matcher = is_not(matcher)
             assert_that(fixture, matcher)
+
+    def test_true_for_degenerative_rect(self):
+        zero_rect = {"x1": 4, "x2": 4, "y1": 2, "y2": 2}
+        rect_pair = {"rectangle1": zero_rect, "rectangle2": zero_rect}
+
+        assert_that(rect_pair, has_rectangle_intersection_matcher())
+
+    def test_false_for_intersection_on_only_one_coordinate(self):
+        rect1 = {"x1": 1, "x2": 4, "y1": -1, "y2": -2}
+        rect2 = {"x1": 2, "x2": 5, "y1": 1, "y2": 2}
+        rect_pair = {"rectangle1": rect1, "rectangle2": rect2}
+
+        assert_that(rect_pair, is_not(has_rectangle_intersection_matcher()))
 
 
 if '__main__' == __name__:

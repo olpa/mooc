@@ -1,7 +1,7 @@
 from hamcrest.core.base_matcher import BaseMatcher
 
 from intersect import has_rectangle_intersection_jsonstr, \
-        has_interval_intersection
+        has_interval_intersection, has_rectangle_intersection
 
 
 class HasRectangleIntersectionJsonstrMatcher(BaseMatcher):
@@ -15,6 +15,19 @@ class HasRectangleIntersectionJsonstrMatcher(BaseMatcher):
 
 def has_rectangle_intersection_jsonstr_matcher():
     return HasRectangleIntersectionJsonstrMatcher()
+
+
+class HasRectangleIntersectionMatcher(BaseMatcher):
+
+    def _matches(self, rect_pair):
+        return has_rectangle_intersection(rect_pair)
+
+    def describe_to(self, description):
+        description.append_text('rectangles should intersect')
+
+
+def has_rectangle_intersection_matcher():
+    return HasRectangleIntersectionMatcher()
 
 
 class HasIntervalIntersectionMatcher(BaseMatcher):
