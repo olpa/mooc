@@ -2,6 +2,30 @@
 name = "aubapr"
 version = "0.1.0"
 edition = "2021"
+description = "Auto-batching proxy service for ML inference"
+license = "MIT"
+repository = "https://github.com/example/aubapr"
+readme = "README.md"
+keywords = ["proxy", "ml", "inference", "batching"]
+categories = ["web-programming::http-server"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_crate_dependencies = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+multiple_crate_versions = "allow"
 
 [dependencies]
 axum = "0.7"
@@ -11,3 +35,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+axum-test = "15.0"
+wiremock = "0.6"
