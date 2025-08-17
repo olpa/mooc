@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  aubapr-inference:
+    build:
+      context: ./aubapr-inference
+      dockerfile: Dockerfile
+    image: olpa/aubapr-inference:latest
+    container_name: aubapr-inference
+    ports:
+      - "8081:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - aubapr-network
+
+  aubapr:
+    build:
+      context: ./aubapr
+      dockerfile: Dockerfile
+    image: olpa/aubapr:latest
+    container_name: aubapr
+    ports:
+      - "8080:8080"
+    environment:
+      - INFERENCE_URL=http://aubapr-inference:8080
+      - RUST_LOG=info
+    depends_on:
+      aubapr-inference:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'healthy'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aubapr-network
+
+networks:
+  aubapr-network:
+    driver: bridge
+
+# For development with live reload (optional)
+# Uncomment the volumes below if you want to mount source code for development
+#
+# volumes:
+#   aubapr-inference:
+#     volumes:
+#       - ./aubapr-inference:/app
+#   aubapr:
+#     volumes:
+#       - ./aubapr/src:/usr/src/app/src
