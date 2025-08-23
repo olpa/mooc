@@ -1,35 +1,45 @@
 //! Core types for batch processing functionality.
 
 use axum::http::StatusCode;
-use tokio::time::Instant;
-use tokio::sync::oneshot;
-use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+
+/// Type alias for a batch of strings (text inputs).
+pub type BatchOfStrings = Vec<String>;
+
+/// Type alias for a batch of embeddings (vectors of f64).
+pub type BatchOfEmbeddings = Vec<Vec<f64>>;
+
+/// Request structure for embedding generation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmbedRequest {
+    /// List of input strings to generate embeddings for.
+    pub inputs: BatchOfStrings,
+}
+
+/// Response structure containing generated embeddings.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmbedResponse {
+    /// Generated embeddings as vectors of floating-point numbers.
+    pub embeddings: BatchOfEmbeddings,
+}
 
 /// A single item in a batch waiting to be processed.
 #[derive(Debug)]
 pub struct BatchItem {
     /// The text to embed.
     pub text: String,
-    /// Unique identifier for the original request this item belongs to.
-    pub request_id: Uuid,
-    /// Channel sender to return the result to the original request.
-    pub sender: oneshot::Sender<BatchResult>,
-    /// When this item was added to the batch queue.
-    pub timestamp: Instant,
+    /// Channel sender to return the result to the original request (only first item has this).
+    pub sender: Option<tokio::sync::oneshot::Sender<BatchResult>>,
 }
 
-/// Result type for batch processing operations.
-pub type BatchResult = Result<Vec<f64>, BatchError>;
+/// Result type for batch processing operations (multiple embeddings).
+pub type BatchResult = Result<BatchOfEmbeddings, BatchError>;
 
 /// Errors that can occur during batch processing.
 #[derive(Debug, Clone)]
 pub enum BatchError {
     /// Error from upstream inference service.
     UpstreamError(StatusCode, String),
-    /// Request timed out waiting for batch processing.
-    Timeout,
-    /// Service is temporarily unavailable due to overload.
-    ServiceUnavailable,
 }
 
 impl BatchError {
@@ -38,8 +48,6 @@ impl BatchError {
     pub const fn to_status_code(&self) -> StatusCode {
         match self {
             Self::UpstreamError(status, _) => *status,
-            Self::Timeout => StatusCode::REQUEST_TIMEOUT,
-            Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -48,10 +56,6 @@ impl BatchError {
     pub fn to_message(&self) -> String {
         match self {
             Self::UpstreamError(_, msg) => msg.clone(),
-            Self::Timeout => "Request timeout waiting for batch processing".to_string(),
-            Self::ServiceUnavailable => {
-                "Service temporarily unavailable due to overload".to_string()
-            }
         }
     }
 }
@@ -62,16 +66,13 @@ mod tests {
 
     #[test]
     fn test_batch_item_creation() {
-        let (tx, _rx) = oneshot::channel();
         let item = BatchItem {
             text: "test text".to_string(),
-            request_id: Uuid::new_v4(),
-            sender: tx,
-            timestamp: Instant::now(),
+            sender: None,
         };
 
         assert_eq!(item.text, "test text");
-        assert!(item.request_id.to_string().len() > 0);
+        assert!(item.sender.is_none());
     }
 
     #[test]
@@ -80,14 +81,6 @@ mod tests {
             BatchError::UpstreamError(StatusCode::BAD_REQUEST, "Bad input".to_string());
         assert_eq!(upstream_error.to_status_code(), StatusCode::BAD_REQUEST);
 
-        let timeout_error = BatchError::Timeout;
-        assert_eq!(timeout_error.to_status_code(), StatusCode::REQUEST_TIMEOUT);
-
-        let unavailable_error = BatchError::ServiceUnavailable;
-        assert_eq!(
-            unavailable_error.to_status_code(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
     }
 
     #[test]
@@ -96,10 +89,5 @@ mod tests {
             BatchError::UpstreamError(StatusCode::BAD_REQUEST, "Custom error".to_string());
         assert_eq!(upstream_error.to_message(), "Custom error");
 
-        let timeout_error = BatchError::Timeout;
-        assert!(timeout_error.to_message().contains("timeout"));
-
-        let unavailable_error = BatchError::ServiceUnavailable;
-        assert!(unavailable_error.to_message().contains("unavailable"));
     }
 }

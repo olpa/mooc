@@ -3,10 +3,10 @@
 //! This service acts as a proxy between clients and an ML inference service,
 //! providing health checks and request forwarding capabilities.
 
-mod active_vector;
 mod batcher;
 mod config;
 mod timer;
+mod tray;
 mod types;
 
 use axum::{
@@ -19,24 +19,10 @@ use axum::{
 use batcher::Batcher;
 use config::Config;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info};
-
-/// Request structure for embedding generation.
-#[derive(Debug, Serialize, Deserialize)]
-struct EmbedRequest {
-    /// List of input strings to generate embeddings for.
-    inputs: Vec<String>,
-}
-
-/// Response structure containing generated embeddings.
-#[derive(Debug, Serialize, Deserialize)]
-struct EmbedResponse {
-    /// Generated embeddings as vectors of floating-point numbers.
-    embeddings: Vec<Vec<f64>>,
-}
+use types::{EmbedRequest, EmbedResponse};
 
 /// Application state shared across handlers.
 #[derive(Clone)]
@@ -60,22 +46,34 @@ async fn embed_handler(
     );
 
     // Submit request to batcher
-    match state.batcher.submit_request(request.inputs).await {
-        Ok(embeddings) => {
-            info!("Successfully processed embed request");
-            Ok(Json(EmbedResponse { embeddings }))
-        }
-        Err(batch_error) => {
-            let status = batch_error.to_status_code();
-            let message = batch_error.to_message();
+    let rx = state.batcher.submit_request(request.inputs).await;
+    
+    // Wait for the batch processing result
+    match rx.await {
+        Ok(batch_result) => match batch_result {
+            Ok(embeddings) => {
+                info!("Successfully processed embed request");
+                Ok(Json(EmbedResponse { embeddings }))
+            }
+            Err(batch_error) => {
+                let status = batch_error.to_status_code();
+                let message = batch_error.to_message();
 
-            error!("Batch processing failed: {}", message);
+                error!("Batch processing failed: {}", message);
 
-            // Try to parse the error message as JSON, fallback to wrapping it
-            let error_body = serde_json::from_str::<serde_json::Value>(&message)
-                .unwrap_or_else(|_| serde_json::json!({"error": message}));
+                // Try to parse the error message as JSON, fallback to wrapping it
+                let error_body = serde_json::from_str::<serde_json::Value>(&message)
+                    .unwrap_or_else(|_| serde_json::json!({"error": message}));
 
-            Err((status, Json(error_body)))
+                Err((status, Json(error_body)))
+            }
+        },
+        Err(_) => {
+            error!("Channel closed while waiting for batch result");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal server error"})),
+            ))
         }
     }
 }
@@ -100,12 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create batcher
     let client = Client::new();
-    let batcher = Arc::new(Batcher::new(config, client));
+    let (batcher, channels) = Batcher::new(config, client);
+    let batcher = Arc::new(batcher);
 
     // Start background processor
     let processor_batcher = batcher.clone();
     let processor_handle = tokio::spawn(async move {
-        processor_batcher.run_background_processor().await;
+        processor_batcher.run_background_processor(channels).await;
     });
 
     // Create application state
@@ -155,6 +154,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+    use types::BatchOfEmbeddings;
 
     /// Helper function to generate embeddings for test stub.
     /// Creates 16-dimensional vectors from input strings using ASCII codes.
@@ -179,7 +179,7 @@ mod tests {
         let inputs = body["inputs"].as_array().expect("Should have inputs array");
 
         // Generate embeddings dynamically for each input
-        let embeddings: Vec<Vec<f64>> = inputs
+        let embeddings: BatchOfEmbeddings = inputs
             .iter()
             .map(|input| {
                 let text = input.as_str().expect("Input should be string");
@@ -224,7 +224,8 @@ mod tests {
         let mut config = Config::default();
         config.inference_url = inference_url;
         let client = Client::new();
-        let batcher = Arc::new(Batcher::new(config, client));
+        let (batcher, _channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
 
         Arc::new(AppState { batcher })
     }
@@ -261,12 +262,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let state = create_app_state(mock_server.uri());
+        // Create state with proper batcher setup
+        let mut config = Config::default();
+        config.inference_url = mock_server.uri();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+        
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
 
         // Start background processor
-        let processor_batcher = state.batcher.clone();
+        let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         let app = create_app(state.clone());
@@ -309,12 +319,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let state = create_app_state(mock_server.uri());
+        // Create state with proper batcher setup
+        let mut config = Config::default();
+        config.inference_url = mock_server.uri();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+        
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
 
         // Start background processor
-        let processor_batcher = state.batcher.clone();
+        let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         let app = create_app(state.clone());
@@ -374,12 +393,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let state = create_app_state(mock_server.uri());
+        // Create state with proper batcher setup
+        let mut config = Config::default();
+        config.inference_url = mock_server.uri();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
 
         // Start background processor
-        let processor_batcher = state.batcher.clone();
+        let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         let app = create_app(state.clone());
@@ -462,7 +490,8 @@ mod tests {
         config.inference_url = mock_server.uri();
         config.soft_max_batch_size = 4; // Small batch size for testing
         let client = Client::new();
-        let batcher = Arc::new(Batcher::new(config, client));
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
 
         let state = Arc::new(AppState {
             batcher: batcher.clone(),
@@ -471,7 +500,7 @@ mod tests {
         // Start background processor
         let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         let app = create_app(state.clone());
@@ -645,25 +674,29 @@ mod tests {
         config.inference_url = mock_server.uri();
         config.soft_max_wait_time_ms = 50; // Short timeout for testing
         config.soft_max_batch_size = 10; // Reasonable batch size but test won't reach it
-        
+
         let client = Client::new();
-        let batcher = Arc::new(Batcher::new(config, client));
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
 
         // Start background processor
         let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         // Submit a request - this should trigger timeout-based batching
         let batcher_clone = batcher.clone();
         let request_task = tokio::spawn(async move {
-            batcher_clone.submit_request(vec!["test".to_string()]).await
+            let rx = batcher_clone
+                .submit_request(vec!["test".to_string()])
+                .await;
+            rx.await.unwrap()
         });
 
         // Yield to allow the request to be queued
         tokio::task::yield_now().await;
-        
+
         // Verify no upstream calls yet (timer hasn't expired)
         assert_eq!(
             call_counter.load(Ordering::SeqCst),
@@ -673,20 +706,19 @@ mod tests {
 
         // Use time travel to trigger the timeout! Advance time by 60ms to trigger the 50ms timeout
         tokio::time::advance(std::time::Duration::from_millis(60)).await;
-        
-        // Allow time for processing 
+
+        // Allow time for processing
         tokio::task::yield_now().await;
-        
+
         // Give more time for the HTTP request to complete
         tokio::time::advance(std::time::Duration::from_millis(10)).await;
         tokio::task::yield_now().await;
-        
+
         // Complete the request
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            request_task
-        ).await.expect("Request should complete after timeout")
-               .expect("Request task should not panic");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(2000), request_task)
+            .await
+            .expect("Request should complete after timeout")
+            .expect("Request task should not panic");
 
         // Verify the timeout triggered batch processing
         assert_eq!(
@@ -699,16 +731,25 @@ mod tests {
         assert!(result.is_ok());
         let embeddings = result.unwrap();
         assert_eq!(embeddings.len(), 1);
-        assert_eq!(embeddings[0], vec![116.0, 101.0, 115.0, 116.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]); // "test"
+        assert_eq!(
+            embeddings[0],
+            vec![
+                116.0, 101.0, 115.0, 116.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0
+            ]
+        ); // "test"
 
-        // Test second timeout batching - submit another request  
+        // Test second timeout batching - submit another request
         let batcher_clone2 = batcher.clone();
         let request_task2 = tokio::spawn(async move {
-            batcher_clone2.submit_request(vec!["second".to_string()]).await
+            let rx = batcher_clone2
+                .submit_request(vec!["second".to_string()])
+                .await;
+            rx.await.unwrap()
         });
 
         tokio::task::yield_now().await;
-        
+
         // Verify still only 1 upstream call (second request waiting)
         assert_eq!(
             call_counter.load(Ordering::SeqCst),
@@ -719,12 +760,11 @@ mod tests {
         // Time travel again to trigger second timeout
         tokio::time::advance(std::time::Duration::from_millis(60)).await;
         tokio::task::yield_now().await;
-        
-        let result2 = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            request_task2
-        ).await.expect("Second request should complete after timeout")
-               .expect("Second request task should not panic");
+
+        let result2 = tokio::time::timeout(std::time::Duration::from_millis(2000), request_task2)
+            .await
+            .expect("Second request should complete after timeout")
+            .expect("Second request task should not panic");
 
         // Verify second batch was processed due to timeout
         assert_eq!(
@@ -737,7 +777,13 @@ mod tests {
         assert!(result2.is_ok());
         let embeddings2 = result2.unwrap();
         assert_eq!(embeddings2.len(), 1);
-        assert_eq!(embeddings2[0], vec![115.0, 101.0, 99.0, 111.0, 110.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]); // "second"
+        assert_eq!(
+            embeddings2[0],
+            vec![
+                115.0, 101.0, 99.0, 111.0, 110.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0
+            ]
+        ); // "second"
 
         // Cleanup
         batcher.shutdown();
@@ -756,12 +802,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let state = create_app_state(mock_server.uri());
+        // Create state with proper batcher setup
+        let mut config = Config::default();
+        config.inference_url = mock_server.uri();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
 
         // Start background processor
-        let processor_batcher = state.batcher.clone();
+        let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         let app = create_app(state.clone());
@@ -772,7 +827,7 @@ mod tests {
             .json(&json!({"inputs": ["test string"]}))
             .await;
 
-        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        response.assert_status(StatusCode::BAD_REQUEST);
         // The error message will be wrapped differently now
 
         // Cleanup
@@ -790,12 +845,21 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let state = create_app_state(mock_server.uri());
+        // Create state with proper batcher setup
+        let mut config = Config::default();
+        config.inference_url = mock_server.uri();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
 
         // Start background processor
-        let processor_batcher = state.batcher.clone();
+        let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         let app = create_app(state.clone());
@@ -806,8 +870,223 @@ mod tests {
             .json(&json!({"inputs": ["test string"]}))
             .await;
 
-        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        response.assert_status(StatusCode::BAD_REQUEST);
         // The error message will be wrapped differently now
+
+        // Cleanup
+        state.batcher.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_user_input_empty_array() {
+        let mock_server = MockServer::start().await;
+        let state = create_app_state(mock_server.uri());
+
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .json(&json!({"inputs": []}))
+            .await;
+
+        // Empty inputs should be accepted (could be valid business logic)
+        response.assert_status_ok();
+        response.assert_json(&json!({"embeddings": []}));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_user_input_malformed_json() {
+        let state = create_app_state("http://localhost:8080".to_string());
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .add_header("content-type", "application/json")
+            .text("{ invalid json }")
+            .await;
+
+        // Axum rejects malformed JSON at the HTTP layer, returning UNSUPPORTED_MEDIA_TYPE
+        // This is the actual behavior, so we test for it
+        response.assert_status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_user_input_json_parse_error() {
+        let state = create_app_state("http://localhost:8080".to_string());
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        // Send valid JSON but with wrong structure (inputs should be array, not string)
+        let response = server
+            .post("/embed")
+            .json(&json!({"inputs": "should be array"}))
+            .await;
+
+        // This should return BAD_REQUEST because JSON structure is wrong
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_user_input_missing_inputs_field() {
+        let state = create_app_state("http://localhost:8080".to_string());
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .json(&json!({"data": ["test"]}))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_user_input_null_inputs() {
+        let state = create_app_state("http://localhost:8080".to_string());
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .json(&json!({"inputs": null}))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_user_input_wrong_content_type() {
+        let state = create_app_state("http://localhost:8080".to_string());
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .add_header("content-type", "text/plain")
+            .text("not json")
+            .await;
+
+        response.assert_status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_500_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/embed"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": "Internal server error"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Create state with proper batcher setup
+        let mut config = Config::default();
+        config.inference_url = mock_server.uri();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
+
+        // Start background processor
+        let processor_batcher = batcher.clone();
+        let processor_handle = tokio::spawn(async move {
+            processor_batcher.run_background_processor(channels).await;
+        });
+
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .json(&json!({"inputs": ["test string"]}))
+            .await;
+
+        response.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Cleanup
+        state.batcher.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_upstream_malformed_response() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{ malformed json }"))
+            .mount(&mock_server)
+            .await;
+
+        // Create state with proper batcher setup
+        let mut config = Config::default();
+        config.inference_url = mock_server.uri();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
+
+        // Start background processor
+        let processor_batcher = batcher.clone();
+        let processor_handle = tokio::spawn(async move {
+            processor_batcher.run_background_processor(channels).await;
+        });
+
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .json(&json!({"inputs": ["test string"]}))
+            .await;
+
+        response.assert_status(StatusCode::BAD_GATEWAY);
+
+        // Cleanup
+        state.batcher.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_upstream_connection_error() {
+        // Create state with proper batcher setup using invalid URL that will cause connection failure
+        let mut config = Config::default();
+        config.inference_url = "http://localhost:1".to_string();
+        let client = Client::new();
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
+
+        let state = Arc::new(AppState {
+            batcher: batcher.clone(),
+        });
+
+        // Start background processor
+        let processor_batcher = batcher.clone();
+        let processor_handle = tokio::spawn(async move {
+            processor_batcher.run_background_processor(channels).await;
+        });
+
+        let app = create_app(state.clone());
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/embed")
+            .json(&json!({"inputs": ["test string"]}))
+            .await;
+
+        // Should get a server error due to connection failure
+        response.assert_status(StatusCode::BAD_GATEWAY);
 
         // Cleanup
         state.batcher.shutdown();

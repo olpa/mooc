@@ -1,189 +1,151 @@
 //! Batcher implementation for coordinating batch processing.
 
-use crate::active_vector::ActiveVector;
 use crate::config::Config;
 use crate::timer::Timer;
-use crate::types::{BatchError, BatchItem, BatchResult};
+use crate::tray::Tray;
+use crate::types::{BatchError, BatchItem, BatchOfStrings, BatchResult, EmbedResponse};
 use axum::http::StatusCode;
 use reqwest::Client;
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::Arc;
 #[allow(unused_imports)]
 use std::time::Duration;
-use tokio::time::Instant;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+
+/// Channel receivers for the background processor.
+#[derive(Debug)]
+pub struct BatcherChannelRcx {
+    /// Channel for batch size notifications.
+    pub batch_rx: mpsc::UnboundedReceiver<Vec<BatchItem>>,
+    /// Channel for Tray to notify Batcher to set timer.
+    pub tray_timer_rx: mpsc::UnboundedReceiver<(u64, Instant)>,
+    /// Channel for timer notifications.
+    pub timer_rx: mpsc::UnboundedReceiver<u64>,
+    /// Shutdown signal.
+    pub shutdown_rx: mpsc::UnboundedReceiver<()>,
+}
 
 /// Main batching coordinator that manages request queuing and processing.
 #[derive(Debug)]
 pub struct Batcher {
     /// Queue of items waiting to be batched.
-    active_vector: Arc<Mutex<ActiveVector>>,
+    tray: Mutex<Tray>,
     /// Timer for batch timeout functionality.
-    #[allow(dead_code)]
-    timer: Arc<Mutex<Timer>>,
+    timer: Mutex<Timer>,
     /// HTTP client for upstream requests.
     client: Client,
     /// Configuration settings.
     config: Config,
-    /// Channel for timer notifications.
-    timer_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<()>>>>,
-    /// Channel for batch size notifications.
-    batch_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<()>>>>,
     /// Shutdown signal.
     shutdown_tx: mpsc::UnboundedSender<()>,
-    shutdown_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<()>>>>,
-    /// Timeout manager task handle.
-    #[allow(dead_code)]
-    timeout_manager: tokio::task::JoinHandle<()>,
 }
 
 impl Batcher {
-    /// Create a new Batcher instance.
+    /// Create a new Batcher instance and its channel receivers.
     #[must_use]
-    pub fn new(config: Config, client: Client) -> Self {
-        let mut active_vector = ActiveVector::new();
-        let mut timer = Timer::new();
-
-        let (timer_tx, timer_rx) = mpsc::unbounded_channel();
-        let (batch_tx, batch_rx) = mpsc::unbounded_channel();
+    pub fn new(config: Config, client: Client) -> (Self, BatcherChannelRcx) {
+        // Create channels for the main event loop
+        let (batch_tx, batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
-        active_vector.set_callbacks(timer_tx, batch_tx);
-        let timer_receiver = timer.take_receiver().expect("Timer should have receiver");
+        // Create channel for Tray to notify Batcher when first item is added
+        let (tray_timer_tx, tray_timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
         
-        // Connect ActiveVector timer notifications to Timer component
-        let timer_arc = Arc::new(Mutex::new(timer));
-        let timer_manager_arc = timer_arc.clone();
-        let timeout_ms = config.soft_max_wait_time_ms;
-        let timeout_manager = tokio::spawn(async move {
-            // Listen for first-item timestamp notifications from ActiveVector
-            let mut timer_notifications = timer_rx;
-            while let Some(timestamp) = timer_notifications.recv().await {
-                // Set timer to fire after timeout duration from the timestamp
-                let mut timer_guard = timer_manager_arc.lock().await;
-                timer_guard.set(std::time::Duration::from_millis(timeout_ms), timestamp);
-            }
-        });
+        // Create Timer and its notification channel
+        let (timer_tx, timer_rx) = mpsc::unbounded_channel::<u64>();
+        let timer = Timer::new(Duration::from_millis(config.soft_max_wait_time_ms), timer_tx);
+        
+        // Create Tray with callbacks to Batcher for timer requests and batch processing
+        let tray = Tray::new(config.soft_max_batch_size, tray_timer_tx, batch_tx);
 
-        Self {
-            active_vector: Arc::new(Mutex::new(active_vector)),
-            timer: timer_arc,
+        let batcher = Self {
+            tray: Mutex::new(tray),
+            timer: Mutex::new(timer),
             client,
             config,
-            timer_rx: Arc::new(Mutex::new(Some(timer_receiver))),
-            batch_rx: Arc::new(Mutex::new(Some(batch_rx))),
             shutdown_tx,
-            shutdown_rx: Arc::new(Mutex::new(Some(shutdown_rx))),
-            timeout_manager,
-        }
+        };
+
+        let channels = BatcherChannelRcx {
+            batch_rx,
+            tray_timer_rx,
+            timer_rx,
+            shutdown_rx,
+        };
+
+        (batcher, channels)
     }
 
     /// Submit a request for batch processing.
-    /// Returns a future that resolves when the batch containing this request is processed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BatchError::ServiceUnavailable` if the queue is full.
-    pub async fn submit_request(&self, inputs: Vec<String>) -> Result<Vec<Vec<f64>>, BatchError> {
+    /// Returns a receiver that will receive the result when the batch containing this request is processed.
+    pub async fn submit_request(
+        &self,
+        inputs: BatchOfStrings,
+    ) -> oneshot::Receiver<BatchResult> {
         if inputs.is_empty() {
-            return Ok(Vec::new());
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Ok(Vec::new()));
+            return rx;
         }
 
-        // Check queue size for backpressure
-        {
-            let av = self.active_vector.lock().await;
-            let queue_size = av.len();
-            drop(av);
-            if queue_size >= self.config.max_queue_size {
-                warn!(
-                    "Queue size {} exceeds max {}, returning 503",
-                    queue_size, self.config.max_queue_size
-                );
-                return Err(BatchError::ServiceUnavailable);
-            }
-        }
+        let (tx, rx) = oneshot::channel::<BatchResult>();
 
-        let request_id = Uuid::new_v4();
-        let mut receivers = Vec::new();
-        let mut batch_items = Vec::new();
-
-        // Create BatchItem for each input
-        for input in inputs {
-            let (tx, rx) = oneshot::channel::<BatchResult>();
-            receivers.push(rx);
-
-            batch_items.push(BatchItem {
+        // Create BatchItem for each input, putting sender only in the first item
+        let mut tx_option = Some(tx);
+        let batch_items: Vec<BatchItem> = inputs
+            .into_iter()
+            .map(|input| BatchItem {
                 text: input,
-                request_id,
-                sender: tx,
-                timestamp: Instant::now(),
-            });
-        }
+                sender: tx_option.take(),
+            })
+            .collect();
 
-        // Add to active vector
+        let batch_size = batch_items.len();
+
+        // Add to tray
         {
-            let mut av = self.active_vector.lock().await;
-            av.extend(batch_items);
+            let mut tray = self.tray.lock().await;
+            tray.append(batch_items);
         }
 
-        debug!(
-            "Submitted request {} with {} inputs",
-            request_id,
-            receivers.len()
-        );
+        debug!("Submitted request with {} inputs", batch_size);
 
-        // Wait for all results
-        let mut results = Vec::new();
-        for rx in receivers {
-            match rx.await {
-                Ok(Ok(embedding)) => results.push(embedding),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(BatchError::Timeout),
-            }
-        }
-
-        Ok(results)
+        rx
     }
 
     /// Start the background processor that handles batching logic.
     /// This runs in an infinite loop until shutdown.
-    #[allow(clippy::cognitive_complexity, clippy::expect_used)]
-    pub async fn run_background_processor(&self) {
+    #[allow(clippy::cognitive_complexity)]
+    pub async fn run_background_processor(&self, channels: BatcherChannelRcx) {
         info!("Starting background batch processor");
 
-        // Take ownership of receivers
-        let mut timer_rx = {
-            let mut rx_guard = self.timer_rx.lock().await;
-            rx_guard.take().expect("Timer receiver should be available")
-        };
-
-        let mut batch_rx = {
-            let mut rx_guard = self.batch_rx.lock().await;
-            rx_guard.take().expect("Batch receiver should be available")
-        };
-
-        let mut shutdown_rx = {
-            let mut rx_guard = self.shutdown_rx.lock().await;
-            rx_guard
-                .take()
-                .expect("Shutdown receiver should be available")
-        };
+        let BatcherChannelRcx {
+            mut batch_rx,
+            mut tray_timer_rx,
+            mut timer_rx,
+            mut shutdown_rx,
+        } = channels;
 
         loop {
             tokio::select! {
                 // Timer notification - time to process batch
-                Some(()) = timer_rx.recv() => {
-                    debug!("Timer notification received");
-                    self.handle_timer_timeout_event().await;
+                Some(seqno) = timer_rx.recv() => {
+                    debug!("Timer notification received with seqno {}", seqno);
+                    self.handle_timer_timeout_event(seqno).await;
                 }
 
                 // Batch size threshold reached
-                Some(()) = batch_rx.recv() => {
-                    debug!("Batch size threshold notification received");
-                    self.handle_batch_threshold_event().await;
+                Some(batch_items) = batch_rx.recv() => {
+                    debug!("Batch size threshold notification received with {} items", batch_items.len());
+                    self.process_batch(batch_items).await;
+                }
+
+                // Tray requests timer to be set
+                Some((seqno, _timestamp)) = tray_timer_rx.recv() => {
+                    debug!("Tray timer request received with seqno {}", seqno);
+                    let mut timer = self.timer.lock().await;
+                    timer.set(seqno);
                 }
 
                 // Shutdown signal
@@ -203,75 +165,16 @@ impl Batcher {
     }
 
     /// Handle timer timeout event from Timer component.
-    async fn handle_timer_timeout_event(&self) {
-        let batch = {
-            let mut av = self.active_vector.lock().await;
-            
-            // Get first item timestamp - this is what we'll process
-            if av.len() == 0 {
-                debug!("Timer fired but queue is empty, ignoring");
-                return;
-            }
-            
-            // Extract a batch
-            av.slice(self.config.soft_max_batch_size)
-        };
+    async fn handle_timer_timeout_event(&self, seqno: u64) {
+        let mut tray = self.tray.lock().await;
 
-        if !batch.is_empty() {
-            info!("Processing timer-triggered batch with {} items", batch.len());
-            self.process_batch(batch).await;
-        }
+        // Use the seqno that was stored when the timer was set
+        // This ensures we only trigger if the timer is still valid
+        tray.trigger_batch(seqno);
     }
 
-    /// Handle timer expiration event (legacy method - kept for compatibility).
-    #[allow(clippy::cognitive_complexity)]
-    async fn handle_timer_event(&self, expected_timestamp: Instant) {
-        let batch = {
-            let mut av = self.active_vector.lock().await;
-
-            // Check if this timer is still valid (first item timestamp matches)
-            if let Some(first_item_time) = av.first_timestamp() {
-                if first_item_time != expected_timestamp {
-                    debug!("Timer event for old batch, ignoring");
-                    return;
-                }
-            } else {
-                debug!("No items in queue, ignoring timer event");
-                return;
-            }
-
-            // Extract a batch
-            av.slice(self.config.soft_max_batch_size)
-        };
-
-        if !batch.is_empty() {
-            info!(
-                "Processing timer-triggered batch with {} items",
-                batch.len()
-            );
-            self.process_batch(batch).await;
-        }
-    }
-
-    /// Handle batch size threshold event.
-    async fn handle_batch_threshold_event(&self) {
-        let batch = {
-            let mut av = self.active_vector.lock().await;
-            if av.len() >= self.config.soft_max_batch_size {
-                av.slice(self.config.soft_max_batch_size)
-            } else {
-                Vec::new()
-            }
-        };
-
-        if !batch.is_empty() {
-            info!("Processing size-triggered batch with {} items", batch.len());
-            self.process_batch(batch).await;
-        }
-    }
 
     /// Process a batch by calling the upstream inference service.
-    #[allow(clippy::cognitive_complexity)]
     async fn process_batch(&self, batch: Vec<BatchItem>) {
         if batch.is_empty() {
             return;
@@ -281,7 +184,7 @@ impl Batcher {
         let start_time = Instant::now();
 
         // Prepare request
-        let texts: Vec<String> = batch.iter().map(|item| item.text.clone()).collect();
+        let texts: BatchOfStrings = batch.iter().map(|item| item.text.clone()).collect();
         let request = json!({ "inputs": texts });
 
         debug!("Sending batch of {} items to upstream service", batch_size);
@@ -296,61 +199,9 @@ impl Batcher {
 
         let processing_time = start_time.elapsed();
 
-        match response {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    // Parse successful response
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(json_response) => {
-                            if let Some(embeddings) =
-                                json_response.get("embeddings").and_then(|e| e.as_array())
-                            {
-                                info!(
-                                    "Successfully processed batch of {} items in {:?}",
-                                    batch_size, processing_time
-                                );
-                                self.distribute_results(batch, embeddings);
-                            } else {
-                                error!("Invalid response format from upstream service");
-                                self.distribute_error(
-                                    batch,
-                                    BatchError::UpstreamError(
-                                        StatusCode::BAD_GATEWAY,
-                                        "Invalid response format".to_string(),
-                                    ),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to parse upstream response: {}", e);
-                            self.distribute_error(
-                                batch,
-                                BatchError::UpstreamError(
-                                    StatusCode::BAD_GATEWAY,
-                                    format!("Failed to parse response: {e}"),
-                                ),
-                            );
-                        }
-                    }
-                } else {
-                    // Handle upstream error
-                    let status = resp.status();
-                    let error_text = resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "Unknown error".to_string());
-                    error!("Upstream service returned error {}: {}", status, error_text);
-
-                    self.distribute_error(
-                        batch,
-                        BatchError::UpstreamError(
-                            StatusCode::from_u16(status.as_u16())
-                                .unwrap_or(StatusCode::BAD_GATEWAY),
-                            error_text,
-                        ),
-                    );
-                }
-            }
+        // Handle connection failure
+        let resp = match response {
+            Ok(resp) => resp,
             Err(e) => {
                 error!("Failed to connect to upstream service: {}", e);
                 self.distribute_error(
@@ -360,81 +211,132 @@ impl Batcher {
                         format!("Connection failed: {e}"),
                     ),
                 );
+                return;
             }
+        };
+
+        // Handle non-success status codes
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!("Upstream service returned error {}: {}", status, error_text);
+
+            self.distribute_error(
+                batch,
+                BatchError::UpstreamError(
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    error_text,
+                ),
+            );
+            return;
         }
+
+        // Parse JSON response and extract embeddings in one step
+        let embed_response = match resp.json::<EmbedResponse>().await {
+            Ok(embed_response) => embed_response,
+            Err(e) => {
+                error!("Failed to parse upstream response: {}", e);
+                self.distribute_error(
+                    batch,
+                    BatchError::UpstreamError(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to parse response: {e}"),
+                    ),
+                );
+                return;
+            }
+        };
+
+        let embeddings = &embed_response.embeddings;
+
+        // Success case
+        debug!(
+            "Successfully processed batch of {} items in {:?}",
+            batch_size, processing_time
+        );
+        self.distribute_results(batch, embeddings);
     }
 
     /// Distribute successful results back to waiting requests.
-    #[allow(clippy::unused_self)]
-    fn distribute_results(&self, batch: Vec<BatchItem>, embeddings: &[serde_json::Value]) {
-        // Group items by request_id
-        let mut requests: HashMap<Uuid, Vec<(usize, BatchItem)>> = HashMap::new();
-
-        for (idx, item) in batch.into_iter().enumerate() {
-            requests
-                .entry(item.request_id)
-                .or_default()
-                .push((idx, item));
+    fn distribute_results(&self, batch: Vec<BatchItem>, embeddings: &[Vec<f64>]) {
+        // Check that batch and embeddings have the same length
+        if batch.len() != embeddings.len() {
+            warn!("Batch size ({}) does not match embeddings count ({})", batch.len(), embeddings.len());
+            // Send error to all senders in the batch
+            for item in batch {
+                if let Some(sender) = item.sender {
+                    if let Err(_) = sender.send(Err(BatchError::UpstreamError(
+                        StatusCode::BAD_GATEWAY,
+                        "Batch size mismatch with embeddings".to_string(),
+                    ))) {
+                        debug!("Client request receiver dropped for error result");
+                    }
+                }
+            }
+            return;
         }
 
-        // Send results to each request
-        for (_request_id, items) in requests {
-            for (idx, item) in items {
-                if let Some(embedding_json) = embeddings.get(idx) {
-                    if let Some(embedding_array) = embedding_json.as_array() {
-                        let embedding: Vec<f64> = embedding_array
-                            .iter()
-                            .filter_map(serde_json::Value::as_f64)
-                            .collect();
+        let mut current_request_results = Vec::new();
+        let mut current_sender: Option<oneshot::Sender<BatchResult>> = None;
 
-                        if embedding.len() == embedding_array.len() {
-                            let _ = item.sender.send(Ok(embedding));
-                        } else {
-                            let _ = item.sender.send(Err(BatchError::UpstreamError(
-                                StatusCode::BAD_GATEWAY,
-                                "Invalid embedding format".to_string(),
-                            )));
-                        }
-                    } else {
-                        let _ = item.sender.send(Err(BatchError::UpstreamError(
-                            StatusCode::BAD_GATEWAY,
-                            "Embedding is not an array".to_string(),
-                        )));
+        // Process each item in the batch paired with its corresponding embedding
+        for (item, embedding) in batch.into_iter().zip(embeddings.iter()) {
+            // If this item has a sender, it means we're starting a new request
+            if let Some(sender) = item.sender {
+                // Send results for the previous request if we have one
+                if let Some(prev_sender) = current_sender.take() {
+                    if let Err(_) = prev_sender.send(Ok(current_request_results)) {
+                        debug!("Client request receiver dropped for successful result");
                     }
-                } else {
-                    let _ = item.sender.send(Err(BatchError::UpstreamError(
-                        StatusCode::BAD_GATEWAY,
-                        "Missing embedding in response".to_string(),
-                    )));
+                    current_request_results = Vec::new();
+                }
+                current_sender = Some(sender);
+            } else {
+                warn!("Found orphan BatchItem without sender - cannot distribute result");
+            }
+
+            // Add the embedding to results
+            current_request_results.push(embedding.clone());
+        }
+
+        // Send results for the last request
+        if let Some(sender) = current_sender {
+            if let Err(_) = sender.send(Ok(current_request_results)) {
+                debug!("Client request receiver dropped for successful result");
+            }
+        } else {
+            warn!("No sender found for final request - all BatchItems were orphans");
+        }
+    }
+
+    /// Distribute error results back to waiting requests.
+    #[allow(clippy::needless_pass_by_value)]
+    fn distribute_error(&self, batch: Vec<BatchItem>, error: BatchError) {
+        // Send error to all senders in the batch
+        for item in batch {
+            if let Some(sender) = item.sender {
+                if let Err(_) = sender.send(Err(error.clone())) {
+                    debug!("Client request receiver dropped for error result");
                 }
             }
         }
     }
 
-    /// Distribute error results back to waiting requests.
-    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
-    fn distribute_error(&self, batch: Vec<BatchItem>, error: BatchError) {
-        for item in batch {
-            let _ = item.sender.send(Err(error.clone()));
-        }
-    }
-
     /// Signal shutdown to the background processor.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
-    }
-
-    /// Get current queue length for monitoring.
-    #[allow(dead_code)]
-    pub async fn queue_length(&self) -> usize {
-        let av = self.active_vector.lock().await;
-        av.len()
+        if let Err(e) = self.shutdown_tx.send(()) {
+            error!("Failed to send shutdown signal: {:?}", e);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -442,7 +344,7 @@ mod tests {
     async fn test_batcher_creation() {
         let config = Config::default();
         let client = Client::new();
-        let _batcher = Batcher::new(config, client);
+        let (_batcher, _channels) = Batcher::new(config, client);
 
         // Batcher created successfully - we can't easily test queue_length without exposing it
         assert!(true);
@@ -452,41 +354,14 @@ mod tests {
     async fn test_submit_empty_request() {
         let config = Config::default();
         let client = Client::new();
-        let batcher = Batcher::new(config, client);
+        let (batcher, _channels) = Batcher::new(config, client);
 
-        let result = batcher.submit_request(vec![]).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        let rx = batcher.submit_request(vec![]).await;
+        let final_result = rx.await.unwrap();
+        assert!(final_result.is_ok());
+        assert!(final_result.unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn test_backpressure() {
-        let mut config = Config::default();
-        config.max_queue_size = 2;
-
-        let client = Client::new();
-        let batcher = Arc::new(Batcher::new(config, client));
-
-        // Fill queue to capacity
-        let batcher1 = batcher.clone();
-        let handle1 =
-            tokio::spawn(async move { batcher1.submit_request(vec!["text1".to_string()]).await });
-
-        let batcher2 = batcher.clone();
-        let handle2 =
-            tokio::spawn(async move { batcher2.submit_request(vec!["text2".to_string()]).await });
-
-        // Give tasks time to add to queue
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // This should fail with ServiceUnavailable
-        let result = batcher.submit_request(vec!["text3".to_string()]).await;
-        assert!(matches!(result, Err(BatchError::ServiceUnavailable)));
-
-        // Cleanup
-        handle1.abort();
-        handle2.abort();
-    }
 
     #[tokio::test]
     async fn test_successful_batch_processing() {
@@ -505,21 +380,22 @@ mod tests {
         config.soft_max_batch_size = 10;
 
         let client = Client::new();
-        let batcher = Arc::new(Batcher::new(config, client));
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
 
         // Start background processor
         let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         // Submit request
-        let result = batcher
+        let rx = batcher
             .submit_request(vec!["text1".to_string(), "text2".to_string()])
             .await;
-
-        assert!(result.is_ok());
-        let embeddings = result.unwrap();
+        let final_result = rx.await.unwrap();
+        assert!(final_result.is_ok());
+        let embeddings = final_result.unwrap();
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[0], vec![0.1, 0.2]);
         assert_eq!(embeddings[1], vec![0.3, 0.4]);
@@ -545,19 +421,20 @@ mod tests {
         config.inference_url = mock_server.uri();
 
         let client = Client::new();
-        let batcher = Arc::new(Batcher::new(config, client));
+        let (batcher, channels) = Batcher::new(config, client);
+        let batcher = Arc::new(batcher);
 
         // Start background processor
         let processor_batcher = batcher.clone();
         let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor().await;
+            processor_batcher.run_background_processor(channels).await;
         });
 
         // Submit request
-        let result = batcher.submit_request(vec!["text1".to_string()]).await;
-
-        assert!(result.is_err());
-        if let Err(BatchError::UpstreamError(status, _)) = result {
+        let rx = batcher.submit_request(vec!["text1".to_string()]).await;
+        let final_result = rx.await.unwrap();
+        assert!(final_result.is_err());
+        if let Err(BatchError::UpstreamError(status, _)) = final_result {
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         } else {
             panic!("Expected UpstreamError");
