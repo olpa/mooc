@@ -10,6 +10,7 @@ use serde_json::json;
 #[allow(unused_imports)]
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -19,11 +20,11 @@ pub struct BatcherChannelRcx {
     /// Channel for batch size notifications.
     pub batch_rx: mpsc::UnboundedReceiver<Vec<BatchItem>>,
     /// Channel for Tray to notify Batcher to set timer.
-    pub tray_timer_rx: mpsc::UnboundedReceiver<(u64, Instant)>,
+    pub tray_timer_rx: mpsc::UnboundedReceiver<u64>,
     /// Channel for timer notifications.
     pub timer_rx: mpsc::UnboundedReceiver<u64>,
-    /// Shutdown signal.
-    pub shutdown_rx: mpsc::UnboundedReceiver<()>,
+    /// Shutdown signal with completion channel.
+    pub shutdown_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
 }
 
 /// Main batching coordinator that manages request queuing and processing.
@@ -37,8 +38,8 @@ pub struct Batcher {
     client: Client,
     /// Configuration settings.
     config: Config,
-    /// Shutdown signal.
-    shutdown_tx: mpsc::UnboundedSender<()>,
+    /// Shutdown signal with completion channel.
+    shutdown_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
 }
 
 impl Batcher {
@@ -47,10 +48,10 @@ impl Batcher {
     pub fn new(config: Config, client: Client) -> (Self, BatcherChannelRcx) {
         // Create channels for the main event loop
         let (batch_tx, batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
-        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
 
         // Create channel for Tray to notify Batcher when first item is added
-        let (tray_timer_tx, tray_timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (tray_timer_tx, tray_timer_rx) = mpsc::unbounded_channel::<u64>();
         
         // Create Timer and its notification channel
         let (timer_tx, timer_rx) = mpsc::unbounded_channel::<u64>();
@@ -117,8 +118,30 @@ impl Batcher {
     /// Start the background processor that handles batching logic.
     /// This runs in an infinite loop until shutdown.
     #[allow(clippy::cognitive_complexity)]
-    pub async fn run_background_processor(&self, channels: BatcherChannelRcx) {
+    /// Spawn the background processor and wait for it to start.
+    pub async fn spawn_background_processor(
+        self: Arc<Self>, 
+        channels: BatcherChannelRcx
+    ) -> tokio::task::JoinHandle<()> {
+        let (started_tx, started_rx) = oneshot::channel();
+        
+        let handle = tokio::spawn(async move {
+            self.run_background_processor(channels, started_tx).await;
+        });
+        
+        // Wait for processor to signal it has started
+        let _ = started_rx.await;
+        
+        handle
+    }
+
+    async fn run_background_processor(&self, channels: BatcherChannelRcx, started_tx: oneshot::Sender<()>) {
         info!("Starting background batch processor");
+        
+        // Signal that we've started
+        if started_tx.send(()).is_err() {
+            error!("Failed to send processor started signal");
+        }
 
         let BatcherChannelRcx {
             mut batch_rx,
@@ -129,28 +152,29 @@ impl Batcher {
 
         loop {
             tokio::select! {
-                // Timer notification - time to process batch
                 Some(seqno) = timer_rx.recv() => {
-                    debug!("Timer notification received with seqno {}", seqno);
+                    debug!("Bg loop: Timer notification received with seqno {}, next: trigger batching", seqno);
                     self.handle_timer_timeout_event(seqno).await;
                 }
 
-                // Batch size threshold reached
                 Some(batch_items) = batch_rx.recv() => {
-                    debug!("Batch size threshold notification received with {} items", batch_items.len());
+                    debug!("Bg loop: Batch received with {} items, next: main logic", batch_items.len());
                     self.process_batch(batch_items).await;
                 }
 
-                // Tray requests timer to be set
-                Some((seqno, _timestamp)) = tray_timer_rx.recv() => {
-                    debug!("Tray timer request received with seqno {}", seqno);
+                Some(seqno) = tray_timer_rx.recv() => {
+                    debug!("Bg loop: Tray restart received with seqno {}, next: reset the timer", seqno);
                     let mut timer = self.timer.lock().await;
                     timer.set(seqno);
                 }
 
-                // Shutdown signal
-                Some(()) = shutdown_rx.recv() => {
-                    info!("Shutdown signal received, stopping batch processor");
+                Some(completion_tx) = shutdown_rx.recv() => {
+                    info!("Bg loop: Shutdown signal received, next: stop the batch processor");
+                    
+                    // Signal shutdown completion before exiting
+                    if completion_tx.send(()).is_err() {
+                        error!("Failed to send shutdown completion signal");
+                    }
                     break;
                 }
 
@@ -294,7 +318,7 @@ impl Batcher {
                     current_request_results = Vec::new();
                 }
                 current_sender = Some(sender);
-            } else {
+            } else if current_sender.is_none() {
                 warn!("Found orphan BatchItem without sender - cannot distribute result");
             }
 
@@ -326,10 +350,22 @@ impl Batcher {
     }
 
     /// Signal shutdown to the background processor.
-    pub fn shutdown(&self) {
-        if let Err(e) = self.shutdown_tx.send(()) {
-            error!("Failed to send shutdown signal: {:?}", e);
+    pub fn shutdown(&self) -> oneshot::Receiver<()> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        
+        // Send shutdown signal with completion channel
+        if self.shutdown_tx.send(completion_tx).is_err() {
+            error!("Channel closed, processor already stopped");
+            // For immediate resolution, we need to create a resolved receiver
+            let (tx, rx) = oneshot::channel();
+            if tx.send(()).is_err() {
+                error!("Impossible, can't recover - failed to send to fresh oneshot channel");
+            }
+            return rx;
         }
+        
+        // Return the completion receiver directly
+        completion_rx
     }
 }
 
@@ -384,10 +420,7 @@ mod tests {
         let batcher = Arc::new(batcher);
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        let processor_handle = batcher.clone().spawn_background_processor(channels).await;
 
         // Submit request
         let rx = batcher
@@ -401,7 +434,7 @@ mod tests {
         assert_eq!(embeddings[1], vec![0.3, 0.4]);
 
         // Cleanup
-        batcher.shutdown();
+        let _ = batcher.shutdown().await;
         let _ = tokio::time::timeout(Duration::from_millis(100), processor_handle).await;
     }
 
@@ -425,10 +458,7 @@ mod tests {
         let batcher = Arc::new(batcher);
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        let processor_handle = batcher.clone().spawn_background_processor(channels).await;
 
         // Submit request
         let rx = batcher.submit_request(vec!["text1".to_string()]).await;
@@ -441,7 +471,7 @@ mod tests {
         }
 
         // Cleanup
-        batcher.shutdown();
+        let _ = batcher.shutdown().await;
         let _ = tokio::time::timeout(Duration::from_millis(100), processor_handle).await;
     }
 }

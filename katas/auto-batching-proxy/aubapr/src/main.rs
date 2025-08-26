@@ -21,7 +21,8 @@ use config::Config;
 use reqwest::Client;
 use std::sync::Arc;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{debug, error, info};
+use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use types::{EmbedRequest, EmbedResponse};
 
 /// Application state shared across handlers.
@@ -52,7 +53,7 @@ async fn embed_handler(
     match rx.await {
         Ok(batch_result) => match batch_result {
             Ok(embeddings) => {
-                info!("Successfully processed embed request");
+                debug!("Successfully processed embed request");
                 Ok(Json(EmbedResponse { embeddings }))
             }
             Err(batch_error) => {
@@ -85,7 +86,13 @@ async fn health_handler() -> Json<serde_json::Value> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .init();
 
     // Load configuration
     let config = Config::from_env();
@@ -101,15 +108,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (batcher, channels) = Batcher::new(config, client);
     let batcher = Arc::new(batcher);
 
-    // Start background processor
-    let processor_batcher = batcher.clone();
-    let processor_handle = tokio::spawn(async move {
-        processor_batcher.run_background_processor(channels).await;
-    });
+    // Clone batcher before consuming it
+    let batcher_for_state = batcher.clone();
+    let batcher_for_shutdown = batcher.clone();
+
+    // Start background processor (consumes batcher)
+    batcher.spawn_background_processor(channels).await;
 
     // Create application state
     let state = Arc::new(AppState {
-        batcher: batcher.clone(),
+        batcher: batcher_for_state,
     });
 
     let app = Router::new()
@@ -137,10 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown
     info!("Shutting down gracefully...");
-    batcher.shutdown();
-
-    // Give some time for background processor to finish
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), processor_handle).await;
+    batcher_for_shutdown.shutdown().await.expect("Shutdown should succeed");
 
     info!("Shutdown complete");
     Ok(())
@@ -155,6 +160,18 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use types::BatchOfEmbeddings;
+
+    /// Initialize debug logging for tests
+    #[cfg(test)]
+    fn init_test_logging() {
+        let filter = EnvFilter::builder()
+            .with_default_directive(LevelFilter::DEBUG.into())
+            .from_env_lossy();
+        
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .try_init();
+    }
 
     /// Helper function to generate embeddings for test stub.
     /// Creates 16-dimensional vectors from input strings using ASCII codes.
@@ -237,23 +254,10 @@ mod tests {
             .with_state(state)
     }
 
-    #[tokio::test]
-    async fn test_health_endpoint() {
-        let state = create_app_state("http://localhost:8080".to_string());
-        let app = create_app(state);
-        let server = TestServer::new(app).unwrap();
 
-        let response = server.get("/health").await;
-
-        response.assert_status_ok();
-        response.assert_json(&json!({"status": "healthy"}));
-    }
-
-    #[tokio::test]
-    async fn test_one_client_one_input() {
+    async fn setup_embed_test_with_batch_size_and_timeout(batch_size: usize, timeout_ms: u64) -> (MockServer, TestServer, Arc<AppState>) {
+        init_test_logging();
         let mock_server = MockServer::start().await;
-
-        let test_input = "test string";
 
         // Set up dynamic mock that generates embeddings using generate_test_embedding
         Mock::given(method("POST"))
@@ -265,6 +269,8 @@ mod tests {
         // Create state with proper batcher setup
         let mut config = Config::default();
         config.inference_url = mock_server.uri();
+        config.soft_max_batch_size = batch_size;
+        config.soft_max_wait_time_ms = timeout_ms;
         let client = Client::new();
         let (batcher, channels) = Batcher::new(config, client);
         let batcher = Arc::new(batcher);
@@ -274,13 +280,30 @@ mod tests {
         });
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        batcher.clone().spawn_background_processor(channels).await;
 
         let app = create_app(state.clone());
         let server = TestServer::new(app).unwrap();
+
+        (mock_server, server, state)
+    }
+
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let (_mock_server, server, _state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
+
+        let response = server.get("/health").await;
+
+        response.assert_status_ok();
+        response.assert_json(&json!({"status": "healthy"}));
+    }
+
+    #[tokio::test]
+    async fn test_one_client_one_input() {
+        let (mock_server, server, state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
+
+        let test_input = "test string";
 
         let response = server
             .post("/embed")
@@ -300,48 +323,29 @@ mod tests {
             "embeddings": [expected_embedding]
         }));
 
+        // Verify mock server received exactly one request
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 1);
+
+        // Verify the request body was as expected
+        let request = &received_requests[0];
+        let body: serde_json::Value = request.body_json().expect("Request should have JSON body");
+        let expected_body = json!({"inputs": [test_input]});
+        assert_eq!(body, expected_body);
+
         // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_one_client_multiple_inputs() {
-        let mock_server = MockServer::start().await;
+        let (mock_server, server, state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
 
         let test_inputs = vec!["hello", "world", "test"];
 
-        // Set up dynamic mock that generates embeddings using generate_test_embedding
-        Mock::given(method("POST"))
-            .and(path("/embed"))
-            .respond_with(create_dynamic_embedding_response)
-            .expect(1) // This ensures the service is called exactly once
-            .mount(&mock_server)
-            .await;
-
-        // Create state with proper batcher setup
-        let mut config = Config::default();
-        config.inference_url = mock_server.uri();
-        let client = Client::new();
-        let (batcher, channels) = Batcher::new(config, client);
-        let batcher = Arc::new(batcher);
-        
-        let state = Arc::new(AppState {
-            batcher: batcher.clone(),
-        });
-
-        // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
-
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
-
         let response = server
             .post("/embed")
-            .json(&json!({"inputs": test_inputs}))
+            .json(&json!({"inputs": test_inputs.clone()}))
             .await;
 
         response.assert_status_ok();
@@ -366,18 +370,22 @@ mod tests {
             "embeddings": expected_embeddings
         }));
 
-        // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        // Verify mock server received exactly one request
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 1);
 
-        // The mock server will automatically verify that it was called exactly once
-        // due to the .expect(1) constraint
+        // Verify the request body was as expected
+        let request = &received_requests[0];
+        let body: serde_json::Value = request.body_json().expect("Request should have JSON body");
+        let expected_body = json!({"inputs": test_inputs});
+        assert_eq!(body, expected_body);
+
+        // Cleanup
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_multiple_clients_multiple_inputs() {
-        let mock_server = MockServer::start().await;
-
         // Client 1 inputs: "hi", "bye"
         let client1_inputs = vec!["hi", "bye"];
         // Client 2 inputs: "foo", "bar", "baz"
@@ -385,50 +393,30 @@ mod tests {
         // Client 3 inputs: "x", "y"
         let client3_inputs = vec!["x", "y"];
 
-        // Set up mock to dynamically generate embeddings using generate_test_embedding
-        Mock::given(method("POST"))
-            .and(path("/embed"))
-            .respond_with(create_dynamic_embedding_response)
-            .expect(1) // This ensures the service is called exactly once
-            .mount(&mock_server)
-            .await;
-
-        // Create state with proper batcher setup
-        let mut config = Config::default();
-        config.inference_url = mock_server.uri();
-        let client = Client::new();
-        let (batcher, channels) = Batcher::new(config, client);
-        let batcher = Arc::new(batcher);
-
-        let state = Arc::new(AppState {
-            batcher: batcher.clone(),
-        });
-
-        // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
-
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
+        // Total inputs: 2 + 3 + 2 = 7
+        let total_inputs = client1_inputs.len() + client2_inputs.len() + client3_inputs.len();
+        let (mock_server, server, state) = setup_embed_test_with_batch_size_and_timeout(total_inputs, 3_600_000).await;
 
         // Make concurrent requests from multiple clients
         let client1_request = server
             .post("/embed")
-            .json(&json!({"inputs": client1_inputs}));
+            .json(&json!({"inputs": client1_inputs.clone()}));
 
         let client2_request = server
             .post("/embed")
-            .json(&json!({"inputs": client2_inputs}));
+            .json(&json!({"inputs": client2_inputs.clone()}));
 
         let client3_request = server
             .post("/embed")
-            .json(&json!({"inputs": client3_inputs}));
+            .json(&json!({"inputs": client3_inputs.clone()}));
 
-        // Execute all requests concurrently
-        let (response1, response2, response3) =
-            tokio::join!(client1_request, client2_request, client3_request);
+        // Execute all requests concurrently with timeout
+        let (response1, response2, response3) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async { tokio::join!(client1_request, client2_request, client3_request) }
+        )
+        .await
+        .expect("All requests should complete within timeout - batching may not be working correctly");
 
         // Verify all responses are successful
         response1.assert_status_ok();
@@ -458,340 +446,258 @@ mod tests {
             ]
         }));
 
-        // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        // Verify mock server received exactly one request
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 1);
 
-        // The mock server will automatically verify that it was called exactly once
-        // due to the .expect(1) constraint
+        // Verify the request body contains all inputs from all clients
+        let request = &received_requests[0];
+        let body: serde_json::Value = request.body_json().expect("Request should have JSON body");
+        let all_inputs: Vec<&str> = client1_inputs.iter()
+            .chain(client2_inputs.iter())
+            .chain(client3_inputs.iter())
+            .map(|s| *s)
+            .collect();
+        let expected_body = json!({"inputs": all_inputs});
+        assert_eq!(body, expected_body);
+
+        // Cleanup
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
-    async fn test_batching_across_multiple_batches() {
-        let mock_server = MockServer::start().await;
+    async fn test_multiple_batching_by_size() {
+        // Setup with batch size 3
+        let (mock_server, server, state) = setup_embed_test_with_batch_size_and_timeout(3, 3_600_000).await;
 
-        // Counter to track upstream calls
-        let call_counter = Arc::new(AtomicUsize::new(0));
-        let counter_for_mock = call_counter.clone();
+        // First batch: client 1 (2 items) + client 2 (2 items) = 4 items total
+        // This should trigger batching when we reach 3 items
+        let client1_inputs = vec!["a", "b"];
+        let client2_inputs = vec!["c", "d"];
 
-        // Set up mock that counts calls and generates dynamic responses
-        Mock::given(method("POST"))
-            .and(path("/embed"))
-            .respond_with(move |req: &wiremock::Request| {
-                // Increment counter for each call
-                counter_for_mock.fetch_add(1, Ordering::SeqCst);
-                create_dynamic_embedding_response(req)
-            })
-            .mount(&mock_server)
-            .await;
-
-        // Configure with small batch size to trigger multiple batches easily
-        let mut config = Config::default();
-        config.inference_url = mock_server.uri();
-        config.soft_max_batch_size = 4; // Small batch size for testing
-        let client = Client::new();
-        let (batcher, channels) = Batcher::new(config, client);
-        let batcher = Arc::new(batcher);
-
-        let state = Arc::new(AppState {
-            batcher: batcher.clone(),
-        });
-
-        // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
-
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
-
-        // FIRST BATCH: 4 clients with total 4 inputs (exactly at batch limit)
-        let batch1_client1_inputs = vec!["a"]; // 1 input
-        let batch1_client2_inputs = vec!["b"]; // 1 input
-        let batch1_client3_inputs = vec!["c"]; // 1 input
-        let batch1_client4_inputs = vec!["d"]; // 1 input
-                                               // Total: 4 inputs (reaches soft_max_batch_size)
-
-        // Make first batch of concurrent requests
-        let batch1_request1 = server
+        // Make concurrent requests from first two clients
+        let client1_request = server
             .post("/embed")
-            .json(&json!({"inputs": batch1_client1_inputs}));
-        let batch1_request2 = server
+            .json(&json!({"inputs": client1_inputs.clone()}));
+
+        let client2_request = server
             .post("/embed")
-            .json(&json!({"inputs": batch1_client2_inputs}));
-        let batch1_request3 = server
-            .post("/embed")
-            .json(&json!({"inputs": batch1_client3_inputs}));
-        let batch1_request4 = server
-            .post("/embed")
-            .json(&json!({"inputs": batch1_client4_inputs}));
+            .json(&json!({"inputs": client2_inputs.clone()}));
 
-        // Execute first batch requests concurrently with timeout
-        let (batch1_response1, batch1_response2, batch1_response3, batch1_response4) =
-            tokio::time::timeout(std::time::Duration::from_millis(100), async {
-                tokio::join!(
-                    batch1_request1,
-                    batch1_request2,
-                    batch1_request3,
-                    batch1_request4
-                )
-            })
-            .await
-            .expect("First batch should complete within timeout");
+        // Wait for first batch to complete with timeout
+        let (response1, response2) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async { tokio::join!(client1_request, client2_request) }
+        )
+        .await
+        .expect("First batch should complete within timeout");
 
-        // Check that there was exactly one upstream call after first batch
-        assert_eq!(
-            call_counter.load(Ordering::SeqCst),
-            1,
-            "Should have exactly 1 upstream call after first batch"
-        );
+        // Verify first batch responses
+        response1.assert_status_ok();
+        response2.assert_status_ok();
 
-        // Verify all first batch responses are successful
-        batch1_response1.assert_status_ok();
-        batch1_response2.assert_status_ok();
-        batch1_response3.assert_status_ok();
-        batch1_response4.assert_status_ok();
-
-        // Verify each client gets their correct embeddings back (first batch)
-        batch1_response1.assert_json(&json!({
+        // Check resolved embeddings for first batch
+        response1.assert_json(&json!({
             "embeddings": [
-                vec![97.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] // "a"
+                vec![97.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "a"
+                vec![98.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "b"
             ]
         }));
 
-        batch1_response2.assert_json(&json!({
+        response2.assert_json(&json!({
             "embeddings": [
-                vec![98.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] // "b"
+                vec![99.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "c"
+                vec![100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "d"
             ]
         }));
 
-        batch1_response3.assert_json(&json!({
-            "embeddings": [
-                vec![99.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] // "c"
-            ]
-        }));
+        // Check first batch call to mock - should be first 3 items plus 1 from overflow
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 1, "Should have exactly 1 upstream call after first batch");
 
-        batch1_response4.assert_json(&json!({
-            "embeddings": [
-                vec![100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] // "d"
-            ]
-        }));
+        let request = &received_requests[0];
+        let body: serde_json::Value = request.body_json().expect("Request should have JSON body");
+        let expected_first_batch = json!({"inputs": ["a", "b", "c", "d"]});
+        assert_eq!(body, expected_first_batch);
 
-        // SECOND BATCH: 3 clients with total 5 inputs (will trigger additional batch processing)
-        let batch2_client1_inputs = vec!["e", "f"]; // 2 inputs
-        let batch2_client2_inputs = vec!["g"]; // 1 input
-        let batch2_client3_inputs = vec!["h", "i"]; // 2 inputs
-                                                    // Total: 5 inputs (may be split across multiple batches)
+        // Second batch: client 3 (1 item) + client 4 (4 items) = 5 items total
+        // This should trigger batching when we reach 3 items
+        let client3_inputs = vec!["e"];
+        let client4_inputs = vec!["f", "g", "h", "i"];
 
-        // Make second batch of concurrent requests
-        let batch2_request1 = server
+        // Make concurrent requests from next two clients
+        let client3_request = server
             .post("/embed")
-            .json(&json!({"inputs": batch2_client1_inputs}));
-        let batch2_request2 = server
+            .json(&json!({"inputs": client3_inputs.clone()}));
+
+        let client4_request = server
             .post("/embed")
-            .json(&json!({"inputs": batch2_client2_inputs}));
-        let batch2_request3 = server
-            .post("/embed")
-            .json(&json!({"inputs": batch2_client3_inputs}));
+            .json(&json!({"inputs": client4_inputs.clone()}));
 
-        // Execute second batch requests concurrently with timeout
-        let (batch2_response1, batch2_response2, batch2_response3) =
-            tokio::time::timeout(std::time::Duration::from_millis(100), async {
-                tokio::join!(batch2_request1, batch2_request2, batch2_request3)
-            })
-            .await
-            .expect("Second batch should complete within timeout");
+        // Wait for second batch to complete with timeout
+        let (response3, response4) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async { tokio::join!(client3_request, client4_request) }
+        )
+        .await
+        .expect("Second batch should complete within timeout");
 
-        // Check that there are now at least 2 upstream calls
-        let calls_after_second_batch = call_counter.load(Ordering::SeqCst);
-        assert!(
-            calls_after_second_batch >= 2,
-            "Should have at least 2 upstream calls after second batch, got {}",
-            calls_after_second_batch
-        );
+        // Verify second batch responses
+        response3.assert_status_ok();
+        response4.assert_status_ok();
 
-        // Verify all second batch responses are successful
-        batch2_response1.assert_status_ok();
-        batch2_response2.assert_status_ok();
-        batch2_response3.assert_status_ok();
-
-        // Verify each client gets their correct embeddings back (second batch)
-        batch2_response1.assert_json(&json!({
+        // Check resolved embeddings for second batch
+        response3.assert_json(&json!({
             "embeddings": [
                 vec![101.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "e"
+            ]
+        }));
+
+        response4.assert_json(&json!({
+            "embeddings": [
                 vec![102.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "f"
-            ]
-        }));
-
-        batch2_response2.assert_json(&json!({
-            "embeddings": [
-                vec![103.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] // "g"
-            ]
-        }));
-
-        batch2_response3.assert_json(&json!({
-            "embeddings": [
+                vec![103.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "g"
                 vec![104.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "h"
                 vec![105.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "i"
             ]
         }));
 
-        // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        // Check second batch call to mock - should be exactly 2 total calls now
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 2, "Should have exactly 2 upstream calls after second batch");
 
-        // Final verification: confirm multiple batches were processed
-        let final_call_count = call_counter.load(Ordering::SeqCst);
-        assert!(
-            final_call_count >= 2,
-            "Should have had at least 2 upstream calls total, got {}",
-            final_call_count
-        );
+        let second_request = &received_requests[1];
+        let second_body: serde_json::Value = second_request.body_json().expect("Request should have JSON body");
+        let expected_second_batch = json!({"inputs": ["e", "f", "g", "h", "i"]});
+        assert_eq!(second_body, expected_second_batch);
+
+        // Cleanup
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_timeout_batching() {
-        let mock_server = MockServer::start().await;
+    async fn test_multiple_batching_by_wait() {
+        // Setup with large batch size (1000) and timeout 200ms
+        let (mock_server, server, state) = setup_embed_test_with_batch_size_and_timeout(1000, 200).await;
 
-        // Counter to track upstream calls
-        let call_counter = Arc::new(AtomicUsize::new(0));
-        let counter_for_mock = call_counter.clone();
+        // First batch: client 1 sends 2 items, should be triggered by timeout
+        let client1_inputs = vec!["a", "b"];
 
-        // Set up mock that counts calls and generates dynamic responses
-        Mock::given(method("POST"))
-            .and(path("/embed"))
-            .respond_with(move |req: &wiremock::Request| {
-                // Increment counter for each call
-                counter_for_mock.fetch_add(1, Ordering::SeqCst);
-                create_dynamic_embedding_response(req)
-            })
-            .mount(&mock_server)
-            .await;
+        let client1_request = server
+            .post("/embed")
+            .json(&json!({"inputs": client1_inputs.clone()}));
 
-        // Configure with short timeout and large batch size so only timeout triggers batching
-        let mut config = Config::default();
-        config.inference_url = mock_server.uri();
-        config.soft_max_wait_time_ms = 50; // Short timeout for testing
-        config.soft_max_batch_size = 10; // Reasonable batch size but test won't reach it
+        // Advance time by 300ms to trigger the 200ms timeout
+        tokio::time::advance(std::time::Duration::from_millis(300)).await;
 
-        let client = Client::new();
-        let (batcher, channels) = Batcher::new(config, client);
-        let batcher = Arc::new(batcher);
+        // Now await the response
+        let response1 = client1_request.await;
 
-        // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        // Verify first batch response
+        response1.assert_status_ok();
 
-        // Submit a request - this should trigger timeout-based batching
-        let batcher_clone = batcher.clone();
-        let request_task = tokio::spawn(async move {
-            let rx = batcher_clone
-                .submit_request(vec!["test".to_string()])
-                .await;
-            rx.await.unwrap()
-        });
-
-        // Yield to allow the request to be queued
-        tokio::task::yield_now().await;
-
-        // Verify no upstream calls yet (timer hasn't expired)
-        assert_eq!(
-            call_counter.load(Ordering::SeqCst),
-            0,
-            "Should have no upstream calls before timeout"
-        );
-
-        // Use time travel to trigger the timeout! Advance time by 60ms to trigger the 50ms timeout
-        tokio::time::advance(std::time::Duration::from_millis(60)).await;
-
-        // Allow time for processing
-        tokio::task::yield_now().await;
-
-        // Give more time for the HTTP request to complete
-        tokio::time::advance(std::time::Duration::from_millis(10)).await;
-        tokio::task::yield_now().await;
-
-        // Complete the request
-        let result = tokio::time::timeout(std::time::Duration::from_millis(2000), request_task)
-            .await
-            .expect("Request should complete after timeout")
-            .expect("Request task should not panic");
-
-        // Verify the timeout triggered batch processing
-        assert_eq!(
-            call_counter.load(Ordering::SeqCst),
-            1,
-            "Should have exactly 1 upstream call after timeout"
-        );
-
-        // Verify the result is correct
-        assert!(result.is_ok());
-        let embeddings = result.unwrap();
-        assert_eq!(embeddings.len(), 1);
-        assert_eq!(
-            embeddings[0],
-            vec![
-                116.0, 101.0, 115.0, 116.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0
+        // Check resolved embeddings for first batch
+        response1.assert_json(&json!({
+            "embeddings": [
+                vec![97.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "a"
+                vec![98.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "b"
             ]
-        ); // "test"
+        }));
 
-        // Test second timeout batching - submit another request
-        let batcher_clone2 = batcher.clone();
-        let request_task2 = tokio::spawn(async move {
-            let rx = batcher_clone2
-                .submit_request(vec!["second".to_string()])
-                .await;
-            rx.await.unwrap()
-        });
+        // Check first batch call to mock
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 1, "Should have exactly 1 upstream call after first batch");
 
-        tokio::task::yield_now().await;
+        let request = &received_requests[0];
+        let body: serde_json::Value = request.body_json().expect("Request should have JSON body");
+        let expected_first_batch = json!({"inputs": ["a", "b"]});
+        assert_eq!(body, expected_first_batch);
 
-        // Verify still only 1 upstream call (second request waiting)
-        assert_eq!(
-            call_counter.load(Ordering::SeqCst),
-            1,
-            "Should still have only 1 upstream call before second timeout"
-        );
+        // Second batch: client 2 (1 item) + client 3 (2 items) = 3 items total
+        // Should be triggered by timeout since batch size is 1000
+        let client2_inputs = vec!["c"];
+        let client3_inputs = vec!["d", "e"];
 
-        // Time travel again to trigger second timeout
-        tokio::time::advance(std::time::Duration::from_millis(60)).await;
-        tokio::task::yield_now().await;
+        let client2_request = server
+            .post("/embed")
+            .json(&json!({"inputs": client2_inputs.clone()}));
 
-        let result2 = tokio::time::timeout(std::time::Duration::from_millis(2000), request_task2)
-            .await
-            .expect("Second request should complete after timeout")
-            .expect("Second request task should not panic");
+        let client3_request = server
+            .post("/embed")
+            .json(&json!({"inputs": client3_inputs.clone()}));
 
-        // Verify second batch was processed due to timeout
-        assert_eq!(
-            call_counter.load(Ordering::SeqCst),
-            2,
-            "Should have exactly 2 upstream calls after second timeout"
-        );
+        // Advance time by 300ms to trigger the 200ms timeout
+        tokio::time::advance(std::time::Duration::from_millis(300)).await;
 
-        // Verify second result
-        assert!(result2.is_ok());
-        let embeddings2 = result2.unwrap();
-        assert_eq!(embeddings2.len(), 1);
-        assert_eq!(
-            embeddings2[0],
-            vec![
-                115.0, 101.0, 99.0, 111.0, 110.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0
+        // Now await the responses
+        let (response2, response3) = tokio::join!(client2_request, client3_request);
+
+        // Verify second batch responses
+        response2.assert_status_ok();
+        response3.assert_status_ok();
+
+        // Check resolved embeddings for second batch
+        response2.assert_json(&json!({
+            "embeddings": [
+                vec![99.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "c"
             ]
-        ); // "second"
+        }));
+
+        response3.assert_json(&json!({
+            "embeddings": [
+                vec![100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "d"
+                vec![101.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "e"
+            ]
+        }));
+
+        // Check second batch call to mock - should be exactly 2 total calls now
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 2, "Should have exactly 2 upstream calls after second batch");
+
+        let second_request = &received_requests[1];
+        let second_body: serde_json::Value = second_request.body_json().expect("Request should have JSON body");
+        let expected_second_batch = json!({"inputs": ["c", "d", "e"]});
+        assert_eq!(second_body, expected_second_batch);
+
+        // Third batch: client 4 sends 1 item, should be triggered by timeout
+        let client4_inputs = vec!["f"];
+
+        let client4_request = server
+            .post("/embed")
+            .json(&json!({"inputs": client4_inputs.clone()}));
+
+        // Advance time by 300ms to trigger the 200ms timeout
+        tokio::time::advance(std::time::Duration::from_millis(300)).await;
+
+        // Now await the response
+        let response4 = client4_request.await;
+
+        // Verify third batch response
+        response4.assert_status_ok();
+
+        // Check resolved embeddings for third batch
+        response4.assert_json(&json!({
+            "embeddings": [
+                vec![102.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // "f"
+            ]
+        }));
+
+        // Check third batch call to mock - should be exactly 3 total calls now
+        let received_requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(received_requests.len(), 3, "Should have exactly 3 upstream calls after third batch");
+
+        let third_request = &received_requests[2];
+        let third_body: serde_json::Value = third_request.body_json().expect("Request should have JSON body");
+        let expected_third_batch = json!({"inputs": ["f"]});
+        assert_eq!(third_body, expected_third_batch);
 
         // Cleanup
-        batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_upstream_error_handling() {
+        init_test_logging();
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -814,10 +720,7 @@ mod tests {
         });
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        batcher.clone().spawn_background_processor(channels).await;
 
         let app = create_app(state.clone());
         let server = TestServer::new(app).unwrap();
@@ -827,16 +730,16 @@ mod tests {
             .json(&json!({"inputs": ["test string"]}))
             .await;
 
-        response.assert_status(StatusCode::BAD_REQUEST);
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
         // The error message will be wrapped differently now
 
         // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_upstream_non_json_error() {
+        init_test_logging();
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -857,10 +760,7 @@ mod tests {
         });
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        batcher.clone().spawn_background_processor(channels).await;
 
         let app = create_app(state.clone());
         let server = TestServer::new(app).unwrap();
@@ -870,21 +770,16 @@ mod tests {
             .json(&json!({"inputs": ["test string"]}))
             .await;
 
-        response.assert_status(StatusCode::BAD_REQUEST);
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
         // The error message will be wrapped differently now
 
         // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_user_input_empty_array() {
-        let mock_server = MockServer::start().await;
-        let state = create_app_state(mock_server.uri());
-
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
+        let (_mock_server, server, _state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
 
         let response = server
             .post("/embed")
@@ -898,9 +793,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_user_input_malformed_json() {
-        let state = create_app_state("http://localhost:8080".to_string());
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
+        let (_mock_server, server, _state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
 
         let response = server
             .post("/embed")
@@ -915,9 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_user_input_json_parse_error() {
-        let state = create_app_state("http://localhost:8080".to_string());
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
+        let (_mock_server, server, _state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
 
         // Send valid JSON but with wrong structure (inputs should be array, not string)
         let response = server
@@ -925,43 +816,37 @@ mod tests {
             .json(&json!({"inputs": "should be array"}))
             .await;
 
-        // This should return BAD_REQUEST because JSON structure is wrong
-        response.assert_status(StatusCode::BAD_REQUEST);
+        // Axum returns UNPROCESSABLE_ENTITY for JSON deserialization errors
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
     async fn test_invalid_user_input_missing_inputs_field() {
-        let state = create_app_state("http://localhost:8080".to_string());
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
+        let (_mock_server, server, _state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
 
         let response = server
             .post("/embed")
             .json(&json!({"data": ["test"]}))
             .await;
 
-        response.assert_status(StatusCode::BAD_REQUEST);
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
     async fn test_invalid_user_input_null_inputs() {
-        let state = create_app_state("http://localhost:8080".to_string());
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
+        let (_mock_server, server, _state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
 
         let response = server
             .post("/embed")
             .json(&json!({"inputs": null}))
             .await;
 
-        response.assert_status(StatusCode::BAD_REQUEST);
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
     async fn test_invalid_user_input_wrong_content_type() {
-        let state = create_app_state("http://localhost:8080".to_string());
-        let app = create_app(state.clone());
-        let server = TestServer::new(app).unwrap();
+        let (_mock_server, server, _state) = setup_embed_test_with_batch_size_and_timeout(0, 3_600_000).await;
 
         let response = server
             .post("/embed")
@@ -974,6 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upstream_500_error() {
+        init_test_logging();
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -996,10 +882,7 @@ mod tests {
         });
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        batcher.clone().spawn_background_processor(channels).await;
 
         let app = create_app(state.clone());
         let server = TestServer::new(app).unwrap();
@@ -1012,12 +895,12 @@ mod tests {
         response.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
 
         // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_upstream_malformed_response() {
+        init_test_logging();
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -1038,10 +921,7 @@ mod tests {
         });
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        batcher.clone().spawn_background_processor(channels).await;
 
         let app = create_app(state.clone());
         let server = TestServer::new(app).unwrap();
@@ -1054,12 +934,12 @@ mod tests {
         response.assert_status(StatusCode::BAD_GATEWAY);
 
         // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[tokio::test]
     async fn test_upstream_connection_error() {
+        init_test_logging();
         // Create state with proper batcher setup using invalid URL that will cause connection failure
         let mut config = Config::default();
         config.inference_url = "http://localhost:1".to_string();
@@ -1072,10 +952,7 @@ mod tests {
         });
 
         // Start background processor
-        let processor_batcher = batcher.clone();
-        let processor_handle = tokio::spawn(async move {
-            processor_batcher.run_background_processor(channels).await;
-        });
+        batcher.clone().spawn_background_processor(channels).await;
 
         let app = create_app(state.clone());
         let server = TestServer::new(app).unwrap();
@@ -1089,7 +966,6 @@ mod tests {
         response.assert_status(StatusCode::BAD_GATEWAY);
 
         // Cleanup
-        state.batcher.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), processor_handle).await;
+        state.batcher.shutdown().await.expect("Shutdown should succeed");
     }
 }

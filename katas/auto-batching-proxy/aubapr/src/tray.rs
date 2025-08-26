@@ -2,7 +2,6 @@
 
 use crate::types::BatchItem;
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 use tracing::error;
 
 /// A wrapper around Vec<BatchItem> that provides controlled access and triggers callbacks.
@@ -11,7 +10,7 @@ pub struct Tray {
     /// Internal storage for batch items.
     items: Vec<BatchItem>,
     /// Callback sender for timer notifications when first item changes.
-    timer_callback: mpsc::UnboundedSender<(u64, Instant)>,
+    timer_callback: mpsc::UnboundedSender<u64>,
     /// Callback sender for batch processing - sends the actual batch.
     batch_callback: mpsc::UnboundedSender<Vec<BatchItem>>,
     /// Soft maximum batch size threshold for triggering batch processing.
@@ -25,7 +24,7 @@ impl Tray {
     #[must_use]
     pub fn new(
         soft_max_batch_size: usize,
-        timer_callback: mpsc::UnboundedSender<(u64, Instant)>,
+        timer_callback: mpsc::UnboundedSender<u64>,
         batch_callback: mpsc::UnboundedSender<Vec<BatchItem>>,
     ) -> Self {
         Self {
@@ -58,7 +57,7 @@ impl Tray {
 
         // If this was the first item being added and we didn't batch, notify timer
         if was_empty {
-            if let Err(e) = self.timer_callback.send((self.batch_seqno, Instant::now())) {
+            if let Err(e) = self.timer_callback.send(self.batch_seqno) {
                 error!(
                     "Failed to send timer notification: seqno={}, error={:?}",
                     self.batch_seqno, e
@@ -97,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_below_threshold() {
-        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(10, timer_tx, batch_tx); // Threshold 10
@@ -114,7 +113,7 @@ mod tests {
         // Should trigger timer callback (first item added)
         let timer_notification = timer_rx.recv().await;
         assert!(timer_notification.is_some());
-        let (seqno, _timestamp) = timer_notification.unwrap();
+        let seqno = timer_notification.unwrap();
         assert_eq!(seqno, 0); // Initial seqno
 
         // Vector should have items and seqno unchanged
@@ -124,7 +123,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_reaches_threshold() {
-        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(2, timer_tx, batch_tx); // Threshold 2
@@ -153,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_multiple_requests() {
-        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(5, timer_tx, batch_tx);
@@ -198,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timer_callback_only_on_first_item() {
-        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, _batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(10, timer_tx, batch_tx);
@@ -220,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_batch_with_matching_seqno() {
-        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(10, timer_tx, batch_tx);
@@ -250,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_batch_with_wrong_seqno() {
-        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(10, timer_tx, batch_tx);
@@ -276,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_batch_empty_vector() {
-        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(10, timer_tx, batch_tx);
@@ -295,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_seqno_increments_correctly() {
-        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(1, timer_tx, batch_tx); // Threshold 1
@@ -324,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_seqno_invalidation() {
-        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<(u64, Instant)>();
+        let (timer_tx, _timer_rx) = mpsc::unbounded_channel::<u64>();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<BatchItem>>();
 
         let mut tray = Tray::new(10, timer_tx, batch_tx); // High threshold
