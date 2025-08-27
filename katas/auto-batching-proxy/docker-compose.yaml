@@ -2,9 +2,6 @@ version: '3.8'
 
 services:
   aubapr-inference:
-    build:
-      context: ./aubapr-inference
-      dockerfile: Dockerfile
     image: olpa/aubapr-inference:latest
     container_name: aubapr-inference
     ports:
@@ -12,7 +9,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -22,21 +19,18 @@ services:
       - aubapr-network
 
   aubapr:
-    build:
-      context: ./aubapr
-      dockerfile: Dockerfile
     image: olpa/aubapr:latest
     container_name: aubapr
     ports:
       - "8080:8080"
     environment:
       - INFERENCE_URL=http://aubapr-inference:8080
-      - RUST_LOG=info
+      - AUBAPR_LOG_LEVEL=debug
     depends_on:
       aubapr-inference:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "echo 'healthy'"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3

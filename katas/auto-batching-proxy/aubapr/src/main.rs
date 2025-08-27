@@ -50,8 +50,8 @@ async fn embed_handler(
     let rx = state.batcher.submit_request(request.inputs).await;
     
     // Wait for the batch processing result
-    match rx.await {
-        Ok(batch_result) => match batch_result {
+    if let Ok(batch_result) = rx.await {
+        match batch_result {
             Ok(embeddings) => {
                 debug!("Successfully processed embed request");
                 Ok(Json(EmbedResponse { embeddings }))
@@ -68,14 +68,13 @@ async fn embed_handler(
 
                 Err((status, Json(error_body)))
             }
-        },
-        Err(_) => {
-            error!("Channel closed while waiting for batch result");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal server error"})),
-            ))
         }
+    } else {
+        error!("Channel closed while waiting for batch result");
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Internal server error"})),
+        ))
     }
 }
 
@@ -86,9 +85,10 @@ async fn health_handler() -> Json<serde_json::Value> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let log_level = std::env::var("AUBAPR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
+        .parse_lossy(&log_level);
     
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -145,7 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown
     info!("Shutting down gracefully...");
-    batcher_for_shutdown.shutdown().await.expect("Shutdown should succeed");
+    if let Err(e) = batcher_for_shutdown.shutdown().await {
+        error!("Failed to shutdown gracefully: {:?}", e);
+    }
 
     info!("Shutdown complete");
     Ok(())
@@ -156,7 +158,6 @@ mod tests {
     use super::*;
     use axum_test::TestServer;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use types::BatchOfEmbeddings;
@@ -164,13 +165,17 @@ mod tests {
     /// Initialize debug logging for tests
     #[cfg(test)]
     fn init_test_logging() {
+        let log_level = std::env::var("AUBAPR_LOG_LEVEL").unwrap_or_else(|_| "debug".to_string());
         let filter = EnvFilter::builder()
             .with_default_directive(LevelFilter::DEBUG.into())
-            .from_env_lossy();
+            .parse_lossy(&log_level);
         
-        let _ = tracing_subscriber::fmt()
+        if let Err(e) = tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .try_init();
+            .try_init()
+        {
+            eprintln!("Failed to initialize tracing subscriber: {}", e);
+        }
     }
 
     /// Helper function to generate embeddings for test stub.
@@ -237,15 +242,6 @@ mod tests {
         ); // 16th char
     }
 
-    fn create_app_state(inference_url: String) -> Arc<AppState> {
-        let mut config = Config::default();
-        config.inference_url = inference_url;
-        let client = Client::new();
-        let (batcher, _channels) = Batcher::new(config, client);
-        let batcher = Arc::new(batcher);
-
-        Arc::new(AppState { batcher })
-    }
 
     fn create_app(state: Arc<AppState>) -> Router {
         Router::new()

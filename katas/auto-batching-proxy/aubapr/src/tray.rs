@@ -303,17 +303,17 @@ mod tests {
 
         // First append - should trigger batch and increment seqno
         tray.append(vec![create_batch_item("text1")]);
-        let _batch = batch_rx.recv().await.unwrap();
+        batch_rx.recv().await.expect("Should receive batch from tray");
         assert_eq!(tray.batch_seqno, 1);
 
         // Second append - should trigger batch and increment seqno
         tray.append(vec![create_batch_item("text2")]);
-        let _batch = batch_rx.recv().await.unwrap();
+        batch_rx.recv().await.expect("Should receive batch from tray");
         assert_eq!(tray.batch_seqno, 2);
 
         // Third append - should trigger batch and increment seqno
         tray.append(vec![create_batch_item("text3")]);
-        let _batch = batch_rx.recv().await.unwrap();
+        batch_rx.recv().await.expect("Should receive batch from tray");
         assert_eq!(tray.batch_seqno, 3);
 
         // Verify seqno keeps incrementing
@@ -335,7 +335,7 @@ mod tests {
 
         // Manually trigger with correct seqno
         tray.trigger_batch(0);
-        let _batch = batch_rx.recv().await.unwrap();
+        batch_rx.recv().await.expect("Should receive batch from tray");
         assert_eq!(tray.batch_seqno, 1);
         assert!(tray.items.is_empty());
 

@@ -42,20 +42,14 @@ impl Timer {
         let task = tokio::spawn(async move {
             sleep(duration).await;
             // Send the seqno when timer fires - ignore send errors if receiver is dropped
-            let _ = sender.send(seqno);
+            if sender.send(seqno).is_err() {
+                tracing::debug!("Timer receiver dropped, timer notification ignored");
+            }
         });
 
         self.current_task = Some(task);
     }
 
-    /// Check if there's an active timer.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        self.current_task
-            .as_ref()
-            .is_some_and(|task| !task.is_finished())
-    }
 
     /// Cancel the current timer if one is active.
     pub fn cancel(&mut self) {
@@ -84,12 +78,6 @@ mod tests {
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
-    #[tokio::test]
-    async fn test_timer_creation() {
-        let (sender, _receiver) = mpsc::unbounded_channel();
-        let timer = Timer::new(Duration::from_millis(50), sender);
-        assert!(!timer.is_active());
-    }
 
     #[tokio::test]
     async fn test_timer_fires() {
@@ -97,7 +85,6 @@ mod tests {
         let mut timer = Timer::new(Duration::from_millis(50), sender);
 
         timer.set(42);
-        assert!(timer.is_active());
 
         // Should receive notification with seqno within reasonable time
         let result = timeout(Duration::from_millis(200), receiver.recv()).await;
@@ -114,7 +101,6 @@ mod tests {
 
         // Set a timer with seqno 1
         timer.set(1);
-        assert!(timer.is_active());
 
         // Wait a bit then reset with seqno 2
         sleep(Duration::from_millis(25)).await;
@@ -138,11 +124,9 @@ mod tests {
         let mut timer = Timer::new(Duration::from_millis(100), sender);
 
         timer.set(99);
-        assert!(timer.is_active());
 
         // Cancel the timer
         timer.cancel();
-        assert!(!timer.is_active());
 
         // Should not receive notification
         let result = timeout(Duration::from_millis(200), receiver.recv()).await;
@@ -171,7 +155,6 @@ mod tests {
             let (sender, _receiver) = mpsc::unbounded_channel();
             let mut timer = Timer::new(Duration::from_millis(100), sender);
             timer.set(777);
-            assert!(timer.is_active());
             // timer is dropped here, which calls cancel()
         }
 

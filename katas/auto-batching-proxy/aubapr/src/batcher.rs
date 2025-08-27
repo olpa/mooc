@@ -7,7 +7,6 @@ use crate::types::{BatchError, BatchItem, BatchOfStrings, BatchResult, EmbedResp
 use axum::http::StatusCode;
 use reqwest::Client;
 use serde_json::json;
-#[allow(unused_imports)]
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use std::sync::Arc;
@@ -16,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 /// Channel receivers for the background processor.
 #[derive(Debug)]
+#[allow(clippy::struct_field_names)]
 pub struct BatcherChannelRcx {
     /// Channel for batch size notifications.
     pub batch_rx: mpsc::UnboundedReceiver<Vec<BatchItem>>,
@@ -86,7 +86,9 @@ impl Batcher {
     ) -> oneshot::Receiver<BatchResult> {
         if inputs.is_empty() {
             let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Ok(Vec::new()));
+            if tx.send(Ok(Vec::new())).is_err() {
+                error!("Failed to send empty result for empty inputs");
+            }
             return rx;
         }
 
@@ -117,7 +119,6 @@ impl Batcher {
 
     /// Start the background processor that handles batching logic.
     /// This runs in an infinite loop until shutdown.
-    #[allow(clippy::cognitive_complexity)]
     /// Spawn the background processor and wait for it to start.
     pub async fn spawn_background_processor(
         self: Arc<Self>, 
@@ -130,7 +131,9 @@ impl Batcher {
         });
         
         // Wait for processor to signal it has started
-        let _ = started_rx.await;
+        if started_rx.await.is_err() {
+            error!("Failed to receive processor started signal");
+        }
         
         handle
     }
@@ -228,9 +231,9 @@ impl Batcher {
             Ok(resp) => resp,
             Err(e) => {
                 error!("Failed to connect to upstream service: {}", e);
-                self.distribute_error(
+                Self::distribute_error(
                     batch,
-                    BatchError::UpstreamError(
+                    &BatchError::UpstreamError(
                         StatusCode::BAD_GATEWAY,
                         format!("Connection failed: {e}"),
                     ),
@@ -248,9 +251,9 @@ impl Batcher {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             error!("Upstream service returned error {}: {}", status, error_text);
 
-            self.distribute_error(
+            Self::distribute_error(
                 batch,
-                BatchError::UpstreamError(
+                &BatchError::UpstreamError(
                     StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                     error_text,
                 ),
@@ -263,9 +266,9 @@ impl Batcher {
             Ok(embed_response) => embed_response,
             Err(e) => {
                 error!("Failed to parse upstream response: {}", e);
-                self.distribute_error(
+                Self::distribute_error(
                     batch,
-                    BatchError::UpstreamError(
+                    &BatchError::UpstreamError(
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to parse response: {e}"),
                     ),
@@ -281,21 +284,21 @@ impl Batcher {
             "Successfully processed batch of {} items in {:?}",
             batch_size, processing_time
         );
-        self.distribute_results(batch, embeddings);
+        Self::distribute_results(batch, embeddings);
     }
 
     /// Distribute successful results back to waiting requests.
-    fn distribute_results(&self, batch: Vec<BatchItem>, embeddings: &[Vec<f64>]) {
+    fn distribute_results(batch: Vec<BatchItem>, embeddings: &[Vec<f64>]) {
         // Check that batch and embeddings have the same length
         if batch.len() != embeddings.len() {
             warn!("Batch size ({}) does not match embeddings count ({})", batch.len(), embeddings.len());
             // Send error to all senders in the batch
             for item in batch {
                 if let Some(sender) = item.sender {
-                    if let Err(_) = sender.send(Err(BatchError::UpstreamError(
+                    if sender.send(Err(BatchError::UpstreamError(
                         StatusCode::BAD_GATEWAY,
                         "Batch size mismatch with embeddings".to_string(),
-                    ))) {
+                    ))).is_err() {
                         debug!("Client request receiver dropped for error result");
                     }
                 }
@@ -312,7 +315,7 @@ impl Batcher {
             if let Some(sender) = item.sender {
                 // Send results for the previous request if we have one
                 if let Some(prev_sender) = current_sender.take() {
-                    if let Err(_) = prev_sender.send(Ok(current_request_results)) {
+                    if prev_sender.send(Ok(current_request_results)).is_err() {
                         debug!("Client request receiver dropped for successful result");
                     }
                     current_request_results = Vec::new();
@@ -328,7 +331,7 @@ impl Batcher {
 
         // Send results for the last request
         if let Some(sender) = current_sender {
-            if let Err(_) = sender.send(Ok(current_request_results)) {
+            if sender.send(Ok(current_request_results)).is_err() {
                 debug!("Client request receiver dropped for successful result");
             }
         } else {
@@ -337,12 +340,11 @@ impl Batcher {
     }
 
     /// Distribute error results back to waiting requests.
-    #[allow(clippy::needless_pass_by_value)]
-    fn distribute_error(&self, batch: Vec<BatchItem>, error: BatchError) {
+    fn distribute_error(batch: Vec<BatchItem>, error: &BatchError) {
         // Send error to all senders in the batch
         for item in batch {
             if let Some(sender) = item.sender {
-                if let Err(_) = sender.send(Err(error.clone())) {
+                if sender.send(Err(error.clone())).is_err() {
                     debug!("Client request receiver dropped for error result");
                 }
             }
@@ -434,8 +436,12 @@ mod tests {
         assert_eq!(embeddings[1], vec![0.3, 0.4]);
 
         // Cleanup
-        let _ = batcher.shutdown().await;
-        let _ = tokio::time::timeout(Duration::from_millis(100), processor_handle).await;
+        if batcher.shutdown().await.is_err() {
+            error!("Failed to shutdown batcher in test cleanup");
+        }
+        if let Err(_timeout) = tokio::time::timeout(Duration::from_millis(100), processor_handle).await {
+            error!("Processor handle did not complete within timeout");
+        }
     }
 
     #[tokio::test]
@@ -471,7 +477,11 @@ mod tests {
         }
 
         // Cleanup
-        let _ = batcher.shutdown().await;
-        let _ = tokio::time::timeout(Duration::from_millis(100), processor_handle).await;
+        if batcher.shutdown().await.is_err() {
+            error!("Failed to shutdown batcher in test cleanup");
+        }
+        if let Err(_timeout) = tokio::time::timeout(Duration::from_millis(100), processor_handle).await {
+            error!("Processor handle did not complete within timeout");
+        }
     }
 }
