@@ -1,0 +1,2 @@
+huggingface_hub[mcp]>=0.32.0
+gradio[mcp]
