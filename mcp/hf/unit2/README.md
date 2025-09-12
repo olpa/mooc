@@ -16,4 +16,13 @@ $ python server.py
 * [Deprecated] SSE URL: http://127.0.0.1:7860/gradio_api/mcp/sse
 ```
 
+##  MCP Configuration Files
+
+https://huggingface.co/learn/mcp-course/unit2/clients
+`mcp.json`
+
+```
+$ tiny-agents run mcp.json
+```
+
 
