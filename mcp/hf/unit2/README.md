@@ -68,3 +68,6 @@ Inside Claude:
      }
 ```
 
+## curl
+
+`curl_client.sh`
