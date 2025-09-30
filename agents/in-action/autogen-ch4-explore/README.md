@@ -24,3 +24,12 @@ The setup of the termination message is not obvious for the first time user:
   a. Type "exit"
   b. Press Enter (empty input) when the termination message is detected
 
+## Chapter 4.2.2 Enhancing code output with agent critics
+
+`autogen_coding_critic.py`
+
+Updated to the new version, based on
+
+- https://microsoft.github.io/autogen/0.2/docs/notebooks/agentchat_nestedchat/
+- https://microsoft.github.io/autogen/docs/notebooks/agentchat_nestedchat/
+
