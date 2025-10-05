@@ -14,7 +14,7 @@ For now, failed to add a tool.
 
 ## Chapter 4.2 Exploring AutoGen
 
-`autogen_start.py`: updated to the version 0.9.
+`autogen_start.py`: updated to the version 0.9. Actually, no: I should use `RoundRobin` agent instead of `register_nested_chat`.
 
 The setup of the termination message is not obvious for the first time user:
 
@@ -28,8 +28,13 @@ The setup of the termination message is not obvious for the first time user:
 
 `autogen_coding_critic.py`
 
-Updated to the new version, based on
+Partially updated to the new version, based on
 
 - https://microsoft.github.io/autogen/0.2/docs/notebooks/agentchat_nestedchat/
 - https://microsoft.github.io/autogen/docs/notebooks/agentchat_nestedchat/
+
+## Chapter 4.4 Building an agent crew with CrewAI
+
+## Chapter 4.4.1 Creating a jokester crew of CrewAI agents
+
 
