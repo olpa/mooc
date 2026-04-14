@@ -1,0 +1,30 @@
+[package]
+name = "aubapr"
+version = "0.1.0"
+edition = "2021"
+description = "Auto-batching proxy service for ML inference"
+license = "MIT"
+repository = "https://github.com/olpa/mooc/tree/aubapr/katas/auto-batching-proxy"
+readme = "README.md"
+keywords = ["proxy", "ml", "inference", "batching"]
+categories = ["web-programming::http-server"]
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1.0", features = ["full", "test-util"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+axum-test = "15.0"
+wiremock = "0.6"
+
+[lints.clippy]
+pedantic = "warn"
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"

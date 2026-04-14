@@ -1,0 +1,6 @@
+target
+venv
+*.swp
+*~
+__pycache__
+

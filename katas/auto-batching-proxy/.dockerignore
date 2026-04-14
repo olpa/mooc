@@ -1,0 +1,48 @@
+# Rust build artifacts
+aubapr/target
+target
+
+# Python cache and virtual environments
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.Python
+**/venv/
+**/env/
+**/.env
+
+# IDE and editor files
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.swo
+*~
+
+# OS generated files
+**/.DS_Store
+**/.DS_Store?
+**/._*
+**/.Spotlight-V100
+**/.Trashes
+**/ehthumbs.db
+**/Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation and session files
+**/*.md
+**/session*.txt
+**/session*.md
+rust-service-dev-interview.md
+vibe-coding/
+
+# Test artifacts
+tests/venv/
+
+# Docker files in subdirectories (to avoid recursive Docker builds)
+**/Dockerfile
+**/docker-compose*.yml
+**/docker-compose*.yaml
