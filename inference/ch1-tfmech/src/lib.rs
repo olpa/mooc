@@ -15,8 +15,8 @@ pub fn transpose_seq_head(batch_size: usize, seq_len: usize, head_dim: usize) ->
 // Returns: (batch_size, seq_len, layer_dim)
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let d_k = k.dim(2)?;
-    let scores = (q.matmul(&k.transpose(1, 2)?)? / (d_k as f64).sqrt())?; // (batch_size, seq_len)
-    let weights = softmax(&scores, 1)?; // (batch_size, seq_len)
+    let scores = (q.matmul(&k.transpose(1, 2)?)? / (d_k as f64).sqrt())?; // (batch_size, seq_len, seq_len)
+    let weights = softmax(&scores, 2)?; // (batch_size, seq_len, seq_len)
     weights.matmul(&v)
 }
 
