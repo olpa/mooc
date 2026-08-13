@@ -18,7 +18,7 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let d_k = k.dim(2)?;
     let scores = (q.matmul(&k.transpose(1, 2)?)? / (d_k as f64).sqrt())?; // (batch_size, seq_len, seq_len)
     let mask =
-        Tensor::triu2(scores.dim(1)?, DType::U8, &Device::Cpu)?.repeat((scores.dim(0)?, 1, 1))?;
+        Tensor::tril2(scores.dim(1)?, DType::U8, &Device::Cpu)?.repeat((scores.dim(0)?, 1, 1))?;
     let minus_inf = Tensor::full(f32::NEG_INFINITY, scores.shape(), &Device::Cpu)?;
     let masked_scores = mask.where_cond(&scores, &minus_inf)?;
     let weights = softmax(&masked_scores, 2)?; // (batch_size, seq_len, seq_len)
