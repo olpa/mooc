@@ -63,30 +63,26 @@ impl Module for MultiHeadAttention {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let batch_size = x.dim(0)?;
         let seq_len = x.dim(1)?;
-        println!("** forward q_proj weight={}", self.q_proj.weight());
-        println!("** forward q_proj bias={}", self.q_proj.bias().unwrap());
-        println!("** forward x={}", x);
-        let q = self.q_proj.forward(x)?.reshape((
-            batch_size,
-            seq_len,
-            self.num_heads,
-            self.head_dim,
-        ))?;
-        let k = self.k_proj.forward(x)?.reshape((
-            batch_size,
-            seq_len,
-            self.num_heads,
-            self.head_dim,
-        ))?;
-        let v = self.v_proj.forward(x)?.reshape((
-            batch_size,
-            seq_len,
-            self.num_heads,
-            self.head_dim,
-        ))?;
-        println!("** forward q={}", q);
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
         let out = causal_attention(&q, &k, &v)?;
-        println!("** forward out={}", out);
+        let out = out.transpose(1, 2)?;
         let out = out.flatten_from(2)?;
         self.out_proj.forward(&out)
     }
