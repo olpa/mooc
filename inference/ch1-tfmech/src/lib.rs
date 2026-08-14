@@ -28,7 +28,7 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     weights.matmul(&v)
 }
 
-struct MultiHeadAttention {
+pub struct MultiHeadAttention {
     num_heads: usize,
     head_dim: usize,
     q_proj: Linear,
