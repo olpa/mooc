@@ -90,3 +90,81 @@ impl Module for MultiHeadAttention {
         self.out_proj.forward(&out) // (batch_size, seq_len, hidden_dim)
     }
 }
+
+trait RepeatInterleaveForGqa {
+    // (batch_size, num_kv_heads, seq_len, head_dim) -> (batch_size, num_kv_heads * repeats, seq_len, head_dim),
+    // repeating each kv head along dim 1 `repeats` times consecutively (unlike
+    // `Tensor::repeat`, which tiles the whole tensor instead of repeating each
+    // element in place). Used to expand kv heads to match the query head count in GQA.
+    fn repeat_interleave_for_gqa(&self, repeats: usize) -> Result<Tensor>;
+}
+
+impl RepeatInterleaveForGqa for Tensor {
+    fn repeat_interleave_for_gqa(&self, repeats: usize) -> Result<Tensor> {
+        let (batch_size, num_kv_heads, seq_len, head_dim) = self.dims4()?;
+        self.unsqueeze(2)?
+            .broadcast_as((batch_size, num_kv_heads, repeats, seq_len, head_dim))?
+            .reshape((batch_size, num_kv_heads * repeats, seq_len, head_dim))
+    }
+}
+
+pub struct GroupedHeadAttention {
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
+}
+
+impl GroupedHeadAttention {
+    pub fn new(
+        hidden_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        vb: &mut VarBuilder,
+    ) -> Result<Self> {
+        let head_dim = hidden_dim / num_q_heads;
+        Ok(Self {
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            q_proj: linear(hidden_dim, num_q_heads * head_dim, vb.push_prefix("q_proj"))?,
+            k_proj: linear(hidden_dim, num_kv_heads * head_dim, vb.push_prefix("k_proj"))?,
+            v_proj: linear(hidden_dim, num_kv_heads * head_dim, vb.push_prefix("v_proj"))?,
+            out_proj: linear(num_q_heads * head_dim, hidden_dim, vb.push_prefix("out_proj"))?,
+        })
+    }
+}
+
+impl Module for GroupedHeadAttention {
+    // Like MultiHeadAttention, but "k" and "v" are repeated
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let batch_size = x.dim(0)?;
+        let seq_len = x.dim(1)?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((batch_size, seq_len, self.num_q_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let kv_repeat = self.num_q_heads / self.num_kv_heads; // extra vs MultiHeadAttention
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .repeat_interleave_for_gqa(kv_repeat)?; // extra vs MultiHeadAttention
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .repeat_interleave_for_gqa(kv_repeat)?; // extra vs MultiHeadAttention
+        let out = causal_attention(&q, &k, &v)?;
+        let out = out.transpose(1, 2)?;
+        let out = out.flatten_from(2)?;
+        self.out_proj.forward(&out)
+    }
+}
