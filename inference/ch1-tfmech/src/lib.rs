@@ -131,9 +131,21 @@ impl GroupedHeadAttention {
             num_kv_heads,
             head_dim,
             q_proj: linear(hidden_dim, num_q_heads * head_dim, vb.push_prefix("q_proj"))?,
-            k_proj: linear(hidden_dim, num_kv_heads * head_dim, vb.push_prefix("k_proj"))?,
-            v_proj: linear(hidden_dim, num_kv_heads * head_dim, vb.push_prefix("v_proj"))?,
-            out_proj: linear(num_q_heads * head_dim, hidden_dim, vb.push_prefix("out_proj"))?,
+            k_proj: linear(
+                hidden_dim,
+                num_kv_heads * head_dim,
+                vb.push_prefix("k_proj"),
+            )?,
+            v_proj: linear(
+                hidden_dim,
+                num_kv_heads * head_dim,
+                vb.push_prefix("v_proj"),
+            )?,
+            out_proj: linear(
+                num_q_heads * head_dim,
+                hidden_dim,
+                vb.push_prefix("out_proj"),
+            )?,
         })
     }
 }
@@ -166,5 +178,27 @@ impl Module for GroupedHeadAttention {
         let out = out.transpose(1, 2)?;
         let out = out.flatten_from(2)?;
         self.out_proj.forward(&out)
+    }
+}
+
+pub struct FeedForward {
+    w1: Linear,
+    w2: Linear,
+}
+
+impl FeedForward {
+    pub fn new(hidden_dim: usize, intermediate_dim: usize, vb: &mut VarBuilder) -> Result<Self> {
+        Ok(Self {
+            w1: linear(hidden_dim, intermediate_dim, vb.push_prefix("w1"))?,
+            w2: linear(intermediate_dim, hidden_dim, vb.push_prefix("w2"))?,
+        })
+    }
+}
+
+impl Module for FeedForward {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let step1 = self.w1.forward(x)?;
+        let relu = step1.relu()?;
+        self.w2.forward(&relu)
     }
 }
