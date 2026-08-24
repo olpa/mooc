@@ -57,3 +57,13 @@ class GroupedQueryAttention(nn.Module):
         v = v.repeat_interleave(self.num_groups, dim=1)
         out = causal_attention(q, k, v)
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, S, -1))
+
+
+class FeedForward(nn.Module):
+    def __init__(self, hidden_dim, intermediate_dim):
+        super().__init__()
+        self.w1 = nn.Linear(hidden_dim, intermediate_dim)
+        self.w2 = nn.Linear(intermediate_dim, hidden_dim)
+
+    def forward(self, x):
+        return self.w2(torch.relu(self.w1(x)))
