@@ -79,3 +79,27 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_dim))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return self.weight * x / rms
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden_dim, num_heads, intermediate_dim):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_dim)
+        self.attn = MultiHeadAttention(hidden_dim, num_heads)
+        self.norm2 = RMSNorm(hidden_dim)
+        self.ffn = SwiGLU(hidden_dim, intermediate_dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        return x + self.ffn(self.norm2(x))
