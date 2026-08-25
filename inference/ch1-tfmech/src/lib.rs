@@ -2,7 +2,7 @@ use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{
     linear, linear_no_bias,
     ops::{silu, softmax},
-    Linear, Module, VarBuilder,
+    rms_norm, Linear, Module, RmsNorm, VarBuilder,
 };
 
 // q, k: (batch_size, seq_len, head_dim)
@@ -228,5 +228,37 @@ impl Module for SwiGLU {
         let step1 = self.w1.forward(x)?;
         let swi = (silu(&step1)? * self.gate.forward(&x)?)?;
         self.w2.forward(&swi)
+    }
+}
+
+pub struct TransformerBlock {
+    norm1: RmsNorm,
+    attn: MultiHeadAttention,
+    norm2: RmsNorm,
+    ffn: SwiGLU,
+}
+
+impl TransformerBlock {
+    pub fn new(
+        hidden_dim: usize,
+        num_heads: usize,
+        intermediate_dim: usize,
+        vb: &mut VarBuilder,
+    ) -> Result<Self> {
+        Ok(Self {
+            norm1: rms_norm(hidden_dim, 1e-6, vb.push_prefix("norm1"))?,
+            attn: MultiHeadAttention::new(hidden_dim, num_heads, &mut vb.push_prefix("attn"))?,
+            norm2: rms_norm(hidden_dim, 1e-6, vb.push_prefix("norm2"))?,
+            ffn: SwiGLU::new(hidden_dim, intermediate_dim, &mut vb.push_prefix("ffn"))?,
+        })
+    }
+}
+
+impl Module for TransformerBlock {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_norm = self.norm1.forward(x)?;
+        let x1 = (x + self.attn.forward(&x_norm)?)?;
+        let x1_norm = self.norm2.forward(&x1)?;
+        x1 + self.ffn.forward(&x1_norm)?
     }
 }
