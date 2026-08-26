@@ -103,3 +103,20 @@ class TransformerBlock(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         return x + self.ffn(self.norm2(x))
+
+
+class Transformer(nn.Module):
+    def __init__(self, vocab_size, hidden_dim, num_layers, num_heads, intermediate_dim):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden_dim)
+        self.layers = nn.ModuleList(
+            [TransformerBlock(hidden_dim, num_heads, intermediate_dim) for _ in range(num_layers)]
+        )
+        self.norm = RMSNorm(hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+
+    def forward(self, input_ids):
+        x = self.embed(input_ids)
+        for layer in self.layers:
+            x = layer(x)
+        return self.lm_head(self.norm(x))
