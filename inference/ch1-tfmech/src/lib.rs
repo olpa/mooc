@@ -1,8 +1,8 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{
-    linear, linear_no_bias,
+    embedding, linear, linear_no_bias,
     ops::{silu, softmax},
-    rms_norm, Linear, Module, RmsNorm, VarBuilder,
+    rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder,
 };
 
 // q, k: (batch_size, seq_len, head_dim)
@@ -260,5 +260,51 @@ impl Module for TransformerBlock {
         let x1 = (x + self.attn.forward(&x_norm)?)?;
         let x1_norm = self.norm2.forward(&x1)?;
         x1 + self.ffn.forward(&x1_norm)?
+    }
+}
+
+pub struct Transformer {
+    embed: Embedding,
+    layers: Vec<TransformerBlock>,
+    norm: RmsNorm,
+    lm_head: Linear,
+}
+
+impl Transformer {
+    pub fn new(
+        vocab_size: usize,
+        hidden_dim: usize,
+        num_layers: usize,
+        num_heads: usize,
+        intermediate_dim: usize,
+        vb: &mut VarBuilder,
+    ) -> Result<Self> {
+        Ok(Self {
+            embed: embedding(vocab_size, hidden_dim, vb.push_prefix("embed"))?,
+            layers: (0..num_layers)
+                .map(|i| {
+                    TransformerBlock::new(
+                        hidden_dim,
+                        num_heads,
+                        intermediate_dim,
+                        &mut vb.push_prefix(format!("layers.{}", i)),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            norm: rms_norm(hidden_dim, 1e-6, vb.push_prefix("norm"))?,
+            lm_head: linear_no_bias(hidden_dim, vocab_size, vb.push_prefix("lm_head"))?,
+        })
+    }
+}
+
+impl Module for Transformer {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = self.embed.forward(x)?;
+        for layer in self.layers.iter() {
+            x = layer.forward(&x)?;
+        }
+        let normed = self.norm.forward(&x)?;
+        self.lm_head.forward(&normed)
     }
 }
