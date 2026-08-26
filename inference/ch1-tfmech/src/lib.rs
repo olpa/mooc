@@ -289,9 +289,8 @@ impl Transformer {
                         intermediate_dim,
                         &mut vb.push_prefix(format!("layers.{}", i)),
                     )
-                    .unwrap()
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             norm: rms_norm(hidden_dim, 1e-6, vb.push_prefix("norm"))?,
             lm_head: linear_no_bias(hidden_dim, vocab_size, vb.push_prefix("lm_head"))?,
         })
