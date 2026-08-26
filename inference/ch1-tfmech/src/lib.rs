@@ -14,7 +14,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let d_k = k.dim(D::Minus1)?;
     let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? / (d_k as f64).sqrt())?; // (batch_size, seq_len, seq_len)
     let weights = softmax(&scores, D::Minus1)?; // (batch_size, seq_len, seq_len)
-    weights.matmul(&v)
+    weights.matmul(v)
 }
 
 // q, k: (..., seq_len, head_dim)
@@ -33,7 +33,7 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let additive_mask = bool_mask.where_cond(&zero, &minus_inf)?;
     let masked_scores = scores.broadcast_add(&additive_mask)?;
     let weights = softmax(&masked_scores, D::Minus1)?; // (..., seq_len, seq_len)
-    weights.matmul(&v)
+    weights.matmul(v)
 }
 
 pub struct MultiHeadAttention {
@@ -226,7 +226,7 @@ impl SwiGLU {
 impl Module for SwiGLU {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let step1 = self.w1.forward(x)?;
-        let swi = (silu(&step1)? * self.gate.forward(&x)?)?;
+        let swi = (silu(&step1)? * self.gate.forward(x)?)?;
         self.w2.forward(&swi)
     }
 }

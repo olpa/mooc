@@ -51,14 +51,6 @@ fn load_fixture(name: &str) -> Fixture {
     serde_json::from_str(&data).expect("invalid fixture JSON")
 }
 
-fn tensor3(data: &[Vec<Vec<f32>>]) -> Tensor {
-    let d0 = data.len();
-    let d1 = data[0].len();
-    let d2 = data[0][0].len();
-    let flat: Vec<f32> = data.iter().flatten().flatten().copied().collect();
-    Tensor::from_vec(flat, (d0, d1, d2), &Device::Cpu).expect("failed to build tensor")
-}
-
 fn tensor2(data: &[Vec<f32>]) -> Tensor {
     let d0 = data.len();
     let d1 = data[0].len();
