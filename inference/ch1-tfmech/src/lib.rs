@@ -210,7 +210,7 @@ impl Module for FeedForward {
 pub struct SwiGLU {
     w1: Linear,
     w2: Linear,
-    gate: Linear,
+    w3: Linear,
 }
 
 impl SwiGLU {
@@ -218,7 +218,7 @@ impl SwiGLU {
         Ok(Self {
             w1: linear_no_bias(hidden_dim, intermediate_dim, vb.push_prefix("w1"))?,
             w2: linear_no_bias(intermediate_dim, hidden_dim, vb.push_prefix("w2"))?,
-            gate: linear_no_bias(hidden_dim, intermediate_dim, vb.push_prefix("w3"))?, // "w3" not "gate" to mirror python reference
+            w3: linear_no_bias(hidden_dim, intermediate_dim, vb.push_prefix("w3"))?,
         })
     }
 }
@@ -226,7 +226,7 @@ impl SwiGLU {
 impl Module for SwiGLU {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let step1 = self.w1.forward(x)?;
-        let swi = (silu(&step1)? * self.gate.forward(x)?)?;
+        let swi = (silu(&step1)? * self.w3.forward(x)?)?;
         self.w2.forward(&swi)
     }
 }
