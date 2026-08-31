@@ -1,0 +1,8 @@
+*~
+*.swp
+target
+doc
+python-reference/.venv
+python-reference/.python-version
+python-reference/__pycache__
+python-reference/fixtures
