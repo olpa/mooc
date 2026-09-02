@@ -3,7 +3,7 @@ PYENV_ROOT     := $(HOME)/.pyenv
 PYENV_PYTHON   := $(PYENV_ROOT)/versions/$(PYTHON_VERSION)/bin/python
 VENV           := ../../.venv
 PYTHON         := $(VENV)/bin/python
-PIP            := $(VENV)/bin/pip
+PIP            := $(PYTHON) -m pip
 
 GEN_SCRIPTS := $(wildcard gen_*.py)
 
