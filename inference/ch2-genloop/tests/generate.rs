@@ -48,13 +48,20 @@ fn run_case(fixture_name: &str) {
     let model = |input_ids: &Tensor| -> candle_core::Result<Tensor> {
         let seq_len = input_ids.dim(1)?;
         let flat = input_ids.flatten_all()?.to_dtype(DType::U32)?;
-        table.index_select(&flat, 0)?.reshape((1, seq_len, vocab_size))
+        table
+            .index_select(&flat, 0)?
+            .reshape((1, seq_len, vocab_size))
     };
 
     let prompt_ids = tensor2_u32(&fixture.prompt_ids);
 
-    let out = generate(model, &prompt_ids, fixture.max_tokens, fixture.eos_token_id)
-        .expect("generate failed");
+    let out = generate(
+        &model,
+        &prompt_ids,
+        fixture.max_tokens,
+        fixture.eos_token_id,
+    )
+    .expect("generate failed");
 
     let out = out.to_vec2::<u32>().expect("expected a 2d u32 tensor");
     assert_eq!(out, fixture.out);
