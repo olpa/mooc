@@ -1,6 +1,12 @@
 import torch
 
 
+def prefill(model, prompt_ids):
+    with torch.no_grad():
+        logits = model(prompt_ids)
+    return logits
+
+
 def generate(model, prompt_ids, max_tokens, eos_token_id):
     input_ids = prompt_ids.clone()
     for _ in range(max_tokens):
