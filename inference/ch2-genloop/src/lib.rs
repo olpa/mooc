@@ -24,3 +24,7 @@ pub fn generate(
     }
     Ok(ids)
 }
+
+pub fn prefill(model: &dyn Module, prompt_ids: &Tensor) -> candle_core::Result<Tensor> {
+    model.forward(prompt_ids)
+}
