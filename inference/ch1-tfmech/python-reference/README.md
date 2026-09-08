@@ -52,10 +52,12 @@ This directory holds:
 ```sh
 make fixtures   # venv + install + run every gen_*.py, writing fixtures/*.json
 make install    # just create the venv and install dependencies
-make clean      # remove .venv and fixtures/
+make clean      # remove fixtures/
 ```
 
-Python version is pinned via `pyenv` (`.python-version` / `Makefile`
+The venv lives at `../../.venv`, shared across all chapters' `python-reference/`
+directories, so it's created once and reused rather than duplicated per
+chapter. Python version is pinned via `pyenv` (`.python-version` / `Makefile`
 `PYTHON_VERSION`) since a modern CPython build is required for `torch`.
 
 ## Adding a new fixture
