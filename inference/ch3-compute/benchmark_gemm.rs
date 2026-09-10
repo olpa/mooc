@@ -9,11 +9,10 @@ fn benchmark_gemm(m: usize, n: usize, k: usize) -> candle_core::Result<f64> {
     cuda.synchronize()?;
     let start = Instant::now();
     for _ in 0..100 {
-        let dummy = a.matmul(&b)?;
-        let _ = black_box(dummy);
+        black_box(a.matmul(&b)?);
     }
     cuda.synchronize()?;
-    return Ok(((2 * m * n * k * 100) as f64) / start.elapsed().as_secs_f64() / 1e12);
+    Ok((2 * m * n * k * 100) as f64 / start.elapsed().as_secs_f64() / 1e12)
 }
 
 fn main() {
