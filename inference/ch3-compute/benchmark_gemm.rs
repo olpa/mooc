@@ -2,10 +2,10 @@ use std::{hint::black_box, time::Instant};
 
 use candle_core::Tensor;
 
-fn benchmark_gemm(m: usize, n: usize, k: usize) -> candle_core::Result<f32> {
+fn benchmark_gemm(m: usize, n: usize, k: usize) -> candle_core::Result<f64> {
     let cuda = candle_core::Device::new_cuda(0)?;
-    let a = Tensor::rand(0.0, 1.0, &[m, k], &cuda)?;
-    let b = Tensor::rand(0.0, 1.0, &[k, n], &cuda)?;
+    let a = Tensor::rand(0f32, 1.0, &[m, k], &cuda)?;
+    let b = Tensor::rand(0f32, 1.0, &[k, n], &cuda)?;
     cuda.synchronize()?;
     let start = Instant::now();
     for _ in 0..100 {
@@ -13,7 +13,7 @@ fn benchmark_gemm(m: usize, n: usize, k: usize) -> candle_core::Result<f32> {
         let _ = black_box(dummy);
     }
     cuda.synchronize()?;
-    return Ok(((2 * m * n * k + 100) as f32) / (start.elapsed().as_millis() as f32) / 1e12);
+    return Ok(((2 * m * n * k * 100) as f64) / start.elapsed().as_secs_f64() / 1e12);
 }
 
 fn main() {
