@@ -18,3 +18,7 @@ serde_json = "1"
 [[bin]]
 name = "benchmark_gemm"
 path = "benchmark_gemm.rs"
+
+[[bin]]
+name = "benchmark_gemv"
+path = "benchmark_gemv.rs"
