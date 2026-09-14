@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "ch1-tfmech",
     "ch2-genloop",
+    "ch3-compute",
 ]
