@@ -8,8 +8,24 @@ __global__ void vector_add(float *a, float *b, float *c, int n) {
     }
 }
 
+__global__ void vector_add_stride(float* a, float* b, float* c, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+  for (int i = idx; i < n; i += stride) {
+    c[i] = a[i] + b[i];
+  }
+}
+
+
 #define VECTOR_SIZE 1000000
 #define VECTOR_BYTES (VECTOR_SIZE * sizeof(float))
+#define BLOCK_SIZE 256
+
+void run_vector_add() {
+    int num_blocks = (VECTOR_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    // d_a, d_b, d_c will be defined later
+    vector_add<<<num_blocks, BLOCK_SIZE>>>(d_a, d_b, d_c, VECTOR_SIZE);
+}
 
 int main() {
     // Allocate memory for vectors on host
