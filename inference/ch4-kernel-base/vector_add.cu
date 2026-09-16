@@ -22,6 +22,7 @@ __global__ void vector_add_stride(float* a, float* b, float* c, int n) {
 #define VECTOR_SIZE 1000000
 #define VECTOR_BYTES (VECTOR_SIZE * sizeof(float))
 #define BLOCK_SIZE 256
+#define GRID_SIZE 16
 
 void run_vector_add(float* a, float* b, float* c) {
     int num_blocks = (VECTOR_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -36,8 +37,7 @@ void run_vector_add(float* a, float* b, float* c) {
 }
 
 void run_vector_add_stride(float* a, float* b, float* c) {
-    int num_blocks = (VECTOR_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    vector_add_stride<<<num_blocks, BLOCK_SIZE>>>(a, b, c, VECTOR_SIZE);
+    vector_add_stride<<<GRID_SIZE, BLOCK_SIZE>>>(a, b, c, VECTOR_SIZE);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -49,7 +49,7 @@ void run_vector_add_stride(float* a, float* b, float* c) {
 
 int main(int argc, char* argv[]) {
     int use_stride = 0;
-    
+
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stride") == 0) {
@@ -70,26 +70,26 @@ int main(int argc, char* argv[]) {
     float *h_vec_sum = (float*)malloc(VECTOR_BYTES);
     float *h_vec_sum_fixture = (float*)malloc(VECTOR_BYTES);
     float *d_a, *d_b, *d_c;
-    
+
     // Check host memory allocation
     if (!h_vec_a || !h_vec_b || !h_vec_sum || !h_vec_sum_fixture) {
         printf("Error: Failed to allocate host memory\n");
         return 1;
     }
-    
+
     // Allocate memory on device
     cudaError_t err = cudaMalloc(&d_a, VECTOR_BYTES);
     if (err != cudaSuccess) {
         printf("Error: Failed to allocate device memory for d_a: %s\n", cudaGetErrorString(err));
         return 1;
     }
-    
+
     err = cudaMalloc(&d_b, VECTOR_BYTES);
     if (err != cudaSuccess) {
         printf("Error: Failed to allocate device memory for d_b: %s\n", cudaGetErrorString(err));
         return 1;
     }
-    
+
     err = cudaMalloc(&d_c, VECTOR_BYTES);
     if (err != cudaSuccess) {
         printf("Error: Failed to allocate device memory for d_c: %s\n", cudaGetErrorString(err));
@@ -113,7 +113,7 @@ int main(int argc, char* argv[]) {
         printf("Error: Failed to copy data from host to device for d_a: %s\n", cudaGetErrorString(err));
         return 1;
     }
-    
+
     err = cudaMemcpy(d_b, h_vec_b, VECTOR_BYTES, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         printf("Error: Failed to copy data from host to device for d_b: %s\n", cudaGetErrorString(err));
