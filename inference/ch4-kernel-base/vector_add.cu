@@ -26,6 +26,18 @@ __global__ void vector_add_stride(float* a, float* b, float* c, int n) {
 void run_vector_add(float* a, float* b, float* c) {
     int num_blocks = (VECTOR_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
     vector_add<<<num_blocks, BLOCK_SIZE>>>(a, b, c, VECTOR_SIZE);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Error: Kernel launch failed: %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("Error: Kernel execution failed: %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
 }
 
 int main() {
@@ -35,9 +47,31 @@ int main() {
     float *h_vec_sum = (float*)malloc(VECTOR_BYTES);
     float *h_vec_sum_fixture = (float*)malloc(VECTOR_BYTES);
     float *d_a, *d_b, *d_c;
-    cudaMalloc(&d_a, VECTOR_BYTES);
-    cudaMalloc(&d_b, VECTOR_BYTES);
-    cudaMalloc(&d_c, VECTOR_BYTES);
+
+    // Check host memory allocation
+    if (!h_vec_a || !h_vec_b || !h_vec_sum || !h_vec_sum_fixture) {
+        printf("Error: Failed to allocate host memory\n");
+        return 1;
+    }
+
+    // Allocate memory on device
+    cudaError_t err = cudaMalloc(&d_a, VECTOR_BYTES);
+    if (err != cudaSuccess) {
+        printf("Error: Failed to allocate device memory for d_a: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    err = cudaMalloc(&d_b, VECTOR_BYTES);
+    if (err != cudaSuccess) {
+        printf("Error: Failed to allocate device memory for d_b: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    err = cudaMalloc(&d_c, VECTOR_BYTES);
+    if (err != cudaSuccess) {
+        printf("Error: Failed to allocate device memory for d_c: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
 
     // Read data from fixture.bin
     FILE *file = fopen("fixture.bin", "rb");
@@ -51,12 +85,25 @@ int main() {
     fread(h_vec_sum_fixture, VECTOR_BYTES, 1, file);
     fclose(file);
 
-    cudaMemcpy(d_a, h_vec_a, VECTOR_BYTES, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, h_vec_b, VECTOR_BYTES, cudaMemcpyHostToDevice);
+    err = cudaMemcpy(d_a, h_vec_a, VECTOR_BYTES, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("Error: Failed to copy data from host to device for d_a: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    err = cudaMemcpy(d_b, h_vec_b, VECTOR_BYTES, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("Error: Failed to copy data from host to device for d_b: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
 
     run_vector_add(d_a, d_b, d_c);
 
-    cudaMemcpy(h_vec_sum, d_c, VECTOR_BYTES, cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(h_vec_sum, d_c, VECTOR_BYTES, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        printf("Error: Failed to copy data from device to host for result: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
 
     // Verify that vec_a + vec_b = vec_sum
     for (int i = 0; i < VECTOR_SIZE; i++) {
@@ -73,9 +120,10 @@ int main() {
     cudaFree(d_c);
     cudaFree(d_b);
     cudaFree(d_a);
-    free(h_vec_a);
-    free(h_vec_b);
+    free(h_vec_sum_fixture);
     free(h_vec_sum);
+    free(h_vec_b);
+    free(h_vec_a);
 
     return 0;
 }
