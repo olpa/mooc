@@ -1,3 +1,5 @@
+#include <cuda_device_runtime_api.h>
+#include <driver_types.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -21,10 +23,9 @@ __global__ void vector_add_stride(float* a, float* b, float* c, int n) {
 #define VECTOR_BYTES (VECTOR_SIZE * sizeof(float))
 #define BLOCK_SIZE 256
 
-void run_vector_add() {
+void run_vector_add(float* a, float* b, float* c) {
     int num_blocks = (VECTOR_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    // d_a, d_b, d_c will be defined later
-    vector_add<<<num_blocks, BLOCK_SIZE>>>(d_a, d_b, d_c, VECTOR_SIZE);
+    vector_add<<<num_blocks, BLOCK_SIZE>>>(a, b, c, VECTOR_SIZE);
 }
 
 int main() {
@@ -32,6 +33,11 @@ int main() {
     float *h_vec_a = (float*)malloc(VECTOR_BYTES);
     float *h_vec_b = (float*)malloc(VECTOR_BYTES);
     float *h_vec_sum = (float*)malloc(VECTOR_BYTES);
+    float *h_vec_sum_fixture = (float*)malloc(VECTOR_BYTES);
+    float *d_a, *d_b, *d_c;
+    cudaMalloc(&d_a, VECTOR_BYTES);
+    cudaMalloc(&d_b, VECTOR_BYTES);
+    cudaMalloc(&d_c, VECTOR_BYTES);
 
     // Read data from fixture.bin
     FILE *file = fopen("fixture.bin", "rb");
@@ -42,14 +48,21 @@ int main() {
 
     fread(h_vec_a, VECTOR_BYTES, 1, file);
     fread(h_vec_b, VECTOR_BYTES, 1, file);
-    fread(h_vec_sum, VECTOR_BYTES, 1, file);
+    fread(h_vec_sum_fixture, VECTOR_BYTES, 1, file);
     fclose(file);
+
+    cudaMemcpy(d_a, h_vec_a, VECTOR_BYTES, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_vec_b, VECTOR_BYTES, cudaMemcpyHostToDevice);
+
+    run_vector_add(d_a, d_b, d_c);
+
+    cudaMemcpy(h_vec_sum, d_c, VECTOR_BYTES, cudaMemcpyDeviceToHost);
 
     // Verify that vec_a + vec_b = vec_sum
     for (int i = 0; i < VECTOR_SIZE; i++) {
-        if (h_vec_a[i] + h_vec_b[i] != h_vec_sum[i]) {
-            printf("Verification failed at index %d: %f + %f != %f\n",
-                   i, h_vec_a[i], h_vec_b[i], h_vec_sum[i]);
+        if (h_vec_sum_fixture[i] != h_vec_sum[i]) {
+            printf("Verification failed at index %d: %f != %f\n",
+                   i, h_vec_sum_fixture[i], h_vec_sum[i]);
             return 1;
         }
     }
@@ -57,6 +70,9 @@ int main() {
     printf("Verification passed: vec_a + vec_b = vec_sum\n");
 
     // Free memory
+    cudaFree(d_c);
+    cudaFree(d_b);
+    cudaFree(d_a);
     free(h_vec_a);
     free(h_vec_b);
     free(h_vec_sum);
