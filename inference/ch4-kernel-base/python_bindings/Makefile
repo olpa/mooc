@@ -12,3 +12,7 @@ test_load_inline:
 .PHONY: setup_module
 setup_module:
 	CC=gcc-11 CXX=g++-11 $(VENV_PIP) install --no-build-isolation --target=opt .
+
+.PHONY: test_custom_module
+test_custom_module:
+	PYTHONPATH=./opt $(VENV_PYTHON) add_cuda_custom_module.py
